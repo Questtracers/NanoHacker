@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>NanoHacker</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060a; overflow: hidden; font-family: monospace; color: #cfe; }
+  #hud {
+    position: fixed; top: 8px; left: 8px; z-index: 10;
+    padding: 8px 12px; background: rgba(0,0,0,0.5);
+    border: 1px solid #0ff5; border-radius: 4px; font-size: 13px;
+    line-height: 1.5; pointer-events: none;
+  }
+  #hud .mode { font-weight: bold; }
+  #hud .stealth { color: #6ef; }
+  #hud .battle  { color: #f66; }
+  #overlay {
+    position: fixed; inset: 0; display: none; z-index: 20;
+    background: rgba(0,0,0,0.75); color: #fff;
+    align-items: center; justify-content: center; flex-direction: column;
+    font-size: 28px;
+  }
+  #overlay button {
+    margin-top: 16px; padding: 10px 22px; font-size: 18px;
+    background: #0ff4; border: 1px solid #0ff; color: #fff;
+    cursor: pointer; font-family: monospace;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.161.0/build/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="hud">
+  <div>NanoHacker</div>
+  <div>Mode: <span id="mode" class="mode stealth">STEALTH</span></div>
+  <div id="obj">Objective: find <b>Spot A</b></div>
+  <div id="hacks" style="color:#c080ff">Hacks: <b>0 / 5</b></div>
+  <div style="opacity:.75">WASD move • R hack • TAB debug</div>
+</div>
+<div id="overlay">
+  <div id="overlay-text">You were eliminated</div>
+  <button onclick="location.reload()">New Run</button>
+</div>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
