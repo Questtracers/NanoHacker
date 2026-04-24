@@ -17,6 +17,9 @@ export class Player {
     this.keys = new Set();
     this.movedThisFrame = false;
     this.lastMoveAmount = 0;
+    // Last direction the player was moving in (persists when idle). The gun
+    // shot uses this as its firing vector. Default: "up" (screen-wise).
+    this.facingDir = { x: 1, z: 0 };
 
     window.addEventListener('keydown', e => this.keys.add(e.key.toLowerCase()));
     window.addEventListener('keyup',   e => this.keys.delete(e.key.toLowerCase()));
@@ -52,7 +55,9 @@ export class Player {
     if (!isWall(map, p.x, nz) && !isWall(map, p.x + 0.3, nz) &&
         !isWall(map, p.x - 0.3, nz) && !isWall(map, p.x, nz + Math.sign(wz) * 0.3)) p.z = nz;
 
-    // face movement direction
+    // face movement direction and memorize it for the gun shot
     this.mesh.rotation.y = Math.atan2(wx, wz);
+    this.facingDir.x = wx;
+    this.facingDir.z = wz;
   }
 }

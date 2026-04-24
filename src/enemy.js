@@ -8,6 +8,8 @@ const BATTLE_CONE_RANGE  = 12;
 const LOSE_SIGHT_TIME    = 2.0;
 const WAIT_TIME          = 1.5;
 const TURN_SPEED         = 2.5;
+const TURN_SPEED_FAST    = 9.0; // boost rate when reacting to bullets
+const TURN_BOOST_TIME    = 0.45;
 const TURN_THRESHOLD     = 0.18; // rad — must be within ~10° before moving
 
 export class Enemy {
@@ -39,14 +41,55 @@ export class Enemy {
     this.coneMesh.renderOrder = 2;
     scene.add(this.coneMesh);
 
-    this.facing       = Math.random() * Math.PI * 2;
-    this.targetFacing = this.facing;
-    this.speed        = 2.0;
+    this.facing          = Math.random() * Math.PI * 2;
+    this.targetFacing    = this.facing;
+    // During a short window after a bullet grazes us the cone swings at a
+    // FAST rate toward the bullet's source regardless of anything else the
+    // AI wants to track — this keeps the reaction feeling sudden.
+    this.bulletFacing    = null;
+    this.turnBoostTimer  = 0;
+    this.speed           = 2.0;
     this.alive        = true;
+    // 'hostile' by default; a successful hack-link flips this to 'friendly'
+    // and the soldier starts hunting other hostiles instead of the player.
+    this.faction      = 'hostile';
 
     this.alerted          = false;
     this.losingSightTimer = 0;
     this.shootCooldown    = 1.0;
+    // Burst fire: 3 bullets close together, then a longer pause.
+    this.burstRemaining   = 3;
+    this.burstGap         = 0.10;
+    this.burstRest        = 1.1;
+
+    // Combat HP. Player bullets shave one hitpoint each.
+    this.maxHp   = 4;
+    this.hp      = this.maxHp;
+    this.hpTimer = 0; // seconds the bar stays visible after a hit
+
+    // HP bar: two thin boxes stacked above the capsule. Hidden until hit.
+    const barW = 0.9, barH = 0.12, barD = 0.02;
+    const bg = new THREE.Mesh(
+      new THREE.BoxGeometry(barW, barH, barD),
+      new THREE.MeshBasicMaterial({ color: 0x550000, depthTest: false }),
+    );
+    bg.position.set(x, 1.35, z);
+    bg.visible = false;
+    bg.renderOrder = 3;
+    scene.add(bg);
+
+    const fg = new THREE.Mesh(
+      new THREE.BoxGeometry(barW, barH, barD * 2),
+      new THREE.MeshBasicMaterial({ color: 0x44ff44, depthTest: false }),
+    );
+    fg.position.set(x, 1.35, z);
+    fg.visible = false;
+    fg.renderOrder = 4;
+    scene.add(fg);
+
+    this.hpBarBg = bg;
+    this.hpBarFg = fg;
+    this.hpBarW  = barW;
 
     // Patrol route
     this.routePath    = null;
@@ -73,9 +116,11 @@ export class Enemy {
     this.patrolPhase = 'move';
   }
 
-  canSee(player, map) {
-    const p = this.mesh.position, pp = player.position;
-    const dx = pp.x - p.x, dz = pp.z - p.z;
+  canSee(player, map) { return this._canSeePos(player.position.x, player.position.z, map); }
+
+  _canSeePos(tx, tz, map) {
+    const p = this.mesh.position;
+    const dx = tx - p.x, dz = tz - p.z;
     const dist = Math.hypot(dx, dz);
     const range = this.alerted ? BATTLE_CONE_RANGE : STEALTH_CONE_RANGE;
     const half  = this.alerted ? BATTLE_CONE_ANGLE  : STEALTH_CONE_ANGLE;
@@ -87,11 +132,48 @@ export class Enemy {
     return rayMarch(map, p.x, p.z, dx / dist, dz / dist, dist) >= dist - 0.1;
   }
 
+  // Nearest visible opposing-faction entity in the world. Hostiles look for
+  // the player + friendlies; friendlies look for hostiles only.
+  _findVisibleTarget(world, map) {
+    const pool = [];
+    if (this.faction === 'hostile') {
+      if (world.player) pool.push({ pos: world.player.position, ent: world.player, isPlayer: true });
+      for (const e of world.enemies || []) {
+        if (e !== this && e.alive && e.faction === 'friendly') pool.push({ pos: e.mesh.position, ent: e });
+      }
+      for (const d of world.drones || []) {
+        if (d.alive && d.faction === 'friendly') pool.push({ pos: d.mesh.position, ent: d });
+      }
+    } else {
+      for (const e of world.enemies || []) {
+        if (e !== this && e.alive && e.faction === 'hostile') pool.push({ pos: e.mesh.position, ent: e });
+      }
+      for (const d of world.drones || []) {
+        if (d.alive && d.faction === 'hostile') pool.push({ pos: d.mesh.position, ent: d });
+      }
+    }
+    let best = null, bestDist = Infinity;
+    const p = this.mesh.position;
+    for (const c of pool) {
+      if (!this._canSeePos(c.pos.x, c.pos.z, map)) continue;
+      const d = Math.hypot(c.pos.x - p.x, c.pos.z - p.z);
+      if (d < bestDist) { bestDist = d; best = c; }
+    }
+    return best;
+  }
+
   _smoothTurn(dt) {
-    let diff = this.targetFacing - this.facing;
+    const boosting = this.turnBoostTimer > 0 && this.bulletFacing !== null;
+    const dest = boosting ? this.bulletFacing : this.targetFacing;
+    let diff = dest - this.facing;
     while (diff >  Math.PI) diff -= Math.PI * 2;
     while (diff < -Math.PI) diff += Math.PI * 2;
-    this.facing += Math.sign(diff) * Math.min(Math.abs(diff), TURN_SPEED * dt);
+    const speed = boosting ? TURN_SPEED_FAST : TURN_SPEED;
+    this.facing += Math.sign(diff) * Math.min(Math.abs(diff), speed * dt);
+    if (this.turnBoostTimer > 0) {
+      this.turnBoostTimer -= dt;
+      if (this.turnBoostTimer <= 0) this.bulletFacing = null;
+    }
   }
 
   _facingError() {
@@ -164,31 +246,51 @@ export class Enemy {
     }
     pos.needsUpdate = true;
     this.coneMesh.geometry.computeBoundingSphere();
-    this.coneMat.color.setHex(this.alerted ? 0xff3030 : 0xffaa00);
+    if (this.faction === 'friendly') {
+      this.coneMat.color.setHex(this.alerted ? 0x3388ff : 0x66ccff);
+    } else {
+      this.coneMat.color.setHex(this.alerted ? 0xff3030 : 0xffaa00);
+    }
     this.coneMat.opacity = this.alerted ? 0.45 : 0.38;
   }
 
-  update(dt, map, player, game) {
+  update(dt, map, world, game) {
     if (!this.alive) return;
+    // Back-compat: if the host still passes the player directly, wrap it.
+    if (world && !world.player && world.position) world = { player: world };
 
-    const seesPlayer = this.canSee(player, map);
+    const target = this._findVisibleTarget(world, map);
+    const seesTarget = target !== null;
 
-    if (seesPlayer) {
+    if (seesTarget) {
+      const wasAlerted = this.alerted;
       this.alerted          = true;
       this.losingSightTimer = 0;
       this.returningToRoute = false;
-      game.onEnemySeesPlayer();
+      // Only notify on the transition — and only when a HOSTILE soldier
+      // actually spots the player (not when a friendly spots a hostile, and
+      // not when seeing another enemy).
+      if (!wasAlerted && this.faction === 'hostile' && target.isPlayer) {
+        game.onEnemySeesPlayer(this, world.player);
+      }
 
-      const dx   = player.position.x - this.mesh.position.x;
-      const dz   = player.position.z - this.mesh.position.z;
+      const dx   = target.pos.x - this.mesh.position.x;
+      const dz   = target.pos.z - this.mesh.position.z;
       const dist = Math.hypot(dx, dz);
       this.targetFacing = Math.atan2(dx, dz);
       if (dist > 3.5) this._tryMove(dx / dist, dz / dist, dt, map);
 
       this.shootCooldown -= dt;
       if (this.shootCooldown <= 0 && dist < BATTLE_CONE_RANGE) {
-        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, dx / dist, dz / dist);
-        this.shootCooldown = 1.2;
+        const owner = this.faction === 'friendly' ? 'player' : 'enemy';
+        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, dx / dist, dz / dist, owner);
+        this.burstRemaining--;
+        if (this.burstRemaining <= 0) {
+          this.burstRemaining = 3;
+          this.shootCooldown  = this.burstRest;
+        } else {
+          this.shootCooldown  = this.burstGap;
+        }
       }
 
     } else if (this.alerted) {
@@ -247,11 +349,72 @@ export class Enemy {
 
     this._smoothTurn(dt);
     this.updateConeMesh(map);
+    this._updateHpBar(dt);
+  }
+
+  _updateHpBar(dt) {
+    const p = this.mesh.position;
+    this.hpBarBg.position.set(p.x, 1.35, p.z);
+    this.hpBarFg.position.set(p.x, 1.35, p.z);
+    // Shrink the green bar from the centre toward the right (left anchor).
+    const ratio = Math.max(0, this.hp / this.maxHp);
+    this.hpBarFg.scale.x = ratio;
+    this.hpBarFg.position.x = p.x - (this.hpBarW * (1 - ratio)) / 2;
+    if (this.hpTimer > 0) {
+      this.hpTimer -= dt;
+      if (this.hpTimer <= 0) {
+        this.hpBarBg.visible = false;
+        this.hpBarFg.visible = false;
+      }
+    }
+  }
+
+  takeDamage(n = 1) {
+    if (!this.alive) return;
+    this.hp -= n;
+    this.hpTimer = 3;
+    this.hpBarBg.visible = true;
+    this.hpBarFg.visible = true;
+    if (this.hp <= 0) this.kill();
+  }
+
+  onBulletNearby(bulletDx, bulletDz) {
+    if (!this.alive) return;
+    // Stash the bullet's origin angle and kick off the boost window. The
+    // _smoothTurn uses this over the AI's targetFacing for ~½ s, so the cone
+    // swings toward the shooter even if the soldier was tracking someone
+    // else — fast but smooth, no teleport.
+    this.bulletFacing   = Math.atan2(-bulletDx, -bulletDz);
+    this.turnBoostTimer = TURN_BOOST_TIME;
+  }
+
+  // Flip this soldier to the player's side: halves HP and switches faction
+  // so they begin hunting hostiles. Visuals recolour to a friendly blue.
+  hackLink() {
+    if (!this.alive || this.faction === 'friendly') return;
+    this.faction = 'friendly';
+    const newHp = Math.max(1, Math.floor(this.maxHp / 2));
+    this.maxHp = newHp;
+    this.hp    = Math.min(this.hp, newHp);
+    this.hpTimer = 4;
+    this.hpBarBg.visible = true;
+    this.hpBarFg.visible = true;
+    if (this.mesh?.material) {
+      this.mesh.material.color.setHex(0x66ccff);
+      if (this.mesh.material.emissive) this.mesh.material.emissive.setHex(0x113355);
+    }
+    this.alerted          = false;
+    this.losingSightTimer = 0;
+    this.returningToRoute = true;
+    this.pathPos          = this._nearestRoutePathPos();
+    this.patrolPhase      = 'move';
   }
 
   kill() {
     this.alive            = false;
     this.mesh.visible     = false;
     this.coneMesh.visible = false;
+    this.hpBarBg.visible  = false;
+    this.hpBarFg.visible  = false;
   }
 }

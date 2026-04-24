@@ -7,11 +7,16 @@
 // - Reaching a 0-cell cascades the cursor through connected 0-chains (combo).
 // - Win by reaching any cell of the 3-cell target band (displays hex address).
 
-const ROWS      = 5;
-const COLS      = 15;
+// ROWS / COLS are recomputed per run from the requested difficulty so the
+// generator can always fit a path with exactly N nodes. They stay let-scoped
+// inside the module — the class can resize freely without leaking outside.
+let   ROWS      = 5;
+let   COLS      = 15;
 const CELL_W    = 2;
 const PREFIX_W  = 14;
 const HACK_TIME = 120;
+const MIN_DIFFICULTY = 1;
+const MAX_DIFFICULTY = 9;
 
 const WALL_TOKENS = [
   'ls','fn','rx','&&','>>','//','cd','px','0x','>>',
@@ -77,7 +82,11 @@ function fmtOp(d)     { return d < 0 ? `drop ${-d}` : `${d}`; }
 function fmtOpPhrase(d) { return d < 0 ? `drop ${-d}` : `add ${d}`; }
 
 export class HackMinigame {
-  constructor() {
+  constructor(hp = {}) {
+    // Host-provided callbacks for the shared hack-points pool
+    this._getHP   = hp.getHP   || (() => 0);
+    this._spendHP = hp.spendHP || (() => {});
+
     this.active          = false;
     this.run             = 1;
     this.depth           = 0;
@@ -95,6 +104,8 @@ export class HackMinigame {
     this.outputTimer     = null;
     this.timeLeft        = HACK_TIME;
     this.clockTimer      = null;
+    this.awaitingDismiss = false;
+    this.difficulty      = 3; // 1..9 ; equals the minimum path-node count.
 
     this._injectCSS();
     this._buildDOM();
@@ -109,42 +120,55 @@ export class HackMinigame {
         position:fixed; inset:0; z-index:50;
         background:#010a05; display:none; flex-direction:row;
         font-family:'Courier New',Courier,monospace;
-        font-size:14px; line-height:1.55;
+        font-size:18px; line-height:1.55;
         color:#22aa55; box-sizing:border-box;
       }
       #hack-main {
         flex:1; display:flex; flex-direction:column;
-        padding:16px 20px; min-width:0; overflow:hidden;
+        padding:18px 24px; min-width:0; overflow:hidden;
       }
       #hack-header {
         display:flex; justify-content:space-between; align-items:baseline;
-        border-bottom:1px solid #1a4a2a; padding-bottom:6px; margin-bottom:8px;
-        font-size:11px; color:#44ff88; letter-spacing:.06em; flex-shrink:0;
+        border-bottom:1px solid #1a4a2a; padding-bottom:8px; margin-bottom:10px;
+        font-size:14px; color:#44ff88; letter-spacing:.06em; flex-shrink:0;
       }
       #hack-output {
-        flex:1; overflow-y:auto; white-space:pre; padding-bottom:4px;
+        flex:1; overflow-y:auto; overflow-x:auto; white-space:pre; padding-bottom:4px;
       }
       #hack-input-row {
-        border-top:1px solid #1a4a2a; padding-top:6px; flex-shrink:0;
+        border-top:1px solid #1a4a2a; padding-top:8px; flex-shrink:0;
         display:flex; align-items:center; color:#44ff88;
+        transition: border-color .2s, color .2s;
       }
+      #hack-input-row.danger { border-top-color:#ff3333; color:#ff3333; }
+      #hack-input-row.danger #hack-input { color:#ff3333; caret-color:#ff3333; }
       #hack-input {
         flex:1; background:transparent; border:none;
         color:#44ff88; font-family:inherit; font-size:inherit;
         outline:none; caret-color:#44ff88;
       }
-      #hack-hint { font-size:10px; color:#1a5a2a; margin-left:12px; white-space:nowrap; }
+      #hack-hint { font-size:13px; color:#1a5a2a; margin-left:14px; white-space:nowrap; }
       #hack-clock-panel {
-        width:152px; flex-shrink:0;
+        width:200px; flex-shrink:0;
         border-left:1px solid #1a4a2a;
         display:flex; flex-direction:column; align-items:center;
-        padding:22px 8px 16px; box-sizing:border-box;
+        padding:24px 10px 18px; box-sizing:border-box;
       }
       #hack-clock-label {
-        color:#2a7a3a; margin-bottom:14px; font-size:10px; letter-spacing:.1em;
+        color:#2a7a3a; margin-bottom:14px; font-size:13px; letter-spacing:.1em;
       }
-      #hack-clock-face  { white-space:pre; line-height:1.35; color:#44ff88; }
-      #hack-clock-time  { margin-top:10px; font-size:12px; color:#44ff88; letter-spacing:.12em; }
+      #hack-clock-face  { white-space:pre; line-height:1.35; color:#44ff88; font-size:18px; }
+      #hack-clock-time  { margin-top:12px; font-size:15px; color:#44ff88; letter-spacing:.12em; }
+      #hack-hp-section { margin-top:22px; text-align:center; }
+      #hack-hp-label   { color:#2a7a3a; font-size:13px; letter-spacing:.1em; }
+      #hack-hp-value   { color:#cc88ff; font-size:26px; font-weight:bold; margin-top:4px; }
+      #hack-legend {
+        margin-top:20px; font-size:12px; line-height:1.7;
+        color:#2a7a3a; width:100%;
+      }
+      #hack-legend .hk-legend-row { display:flex; justify-content:space-between; padding:0 2px; }
+      #hack-legend b   { color:#44ff88; font-weight:bold; }
+      #hack-legend .hp { color:#cc88ff; font-weight:bold; }
       .hk-wall    { color:#1e6b2e; }
       .hk-num     { color:#44ff88; font-weight:bold; }
       .hk-neg     { color:#ff9944; font-weight:bold; }
@@ -155,6 +179,7 @@ export class HackMinigame {
       .hk-cursor  { background:#44ff88; color:#010a05; font-weight:bold; }
       .hk-err     { color:#ff4444; }
       .hk-ok      { color:#00ffff; }
+      .hk-winroute{ color:#00ffff; font-weight:bold; }
       .hk-routine { color:#cc88ff; font-weight:bold; }
       .hk-comment { color:#2a7a3a; }
       .hk-dim     { color:#1e5a2e; }
@@ -197,7 +222,7 @@ export class HackMinigame {
 
     const hint = document.createElement('span');
     hint.id = 'hack-hint';
-    hint.textContent = '[ESC] abort  ·  type "cls" to regen all funcs';
+    hint.textContent = '[ESC] abort';
 
     form.appendChild(prompt);
     form.appendChild(input);
@@ -225,6 +250,28 @@ export class HackMinigame {
     clockPanel.appendChild(clockFace);
     clockPanel.appendChild(clockTime);
 
+    // ── Hack-points counter
+    const hpSection = document.createElement('div');
+    hpSection.id = 'hack-hp-section';
+    const hpLabel = document.createElement('div');
+    hpLabel.id = 'hack-hp-label';
+    hpLabel.textContent = '─ HACK POINTS ─';
+    const hpValue = document.createElement('div');
+    hpValue.id = 'hack-hp-value';
+    hpValue.textContent = '0';
+    hpSection.appendChild(hpLabel);
+    hpSection.appendChild(hpValue);
+    clockPanel.appendChild(hpSection);
+
+    // ── Premium-action legend (HP-gated commands)
+    const legend = document.createElement('div');
+    legend.id = 'hack-legend';
+    legend.innerHTML =
+      `<div class="hk-legend-row"><span><b>cls</b> regen funcs</span><span class="hp">1 HP</span></div>` +
+      `<div class="hk-legend-row"><span><b>1..4</b> quick fn</span><span class="hp">1 HP</span></div>` +
+      `<div class="hk-legend-row"><span><b>overclock</b> +60s</span><span class="hp">2 HP</span></div>`;
+    clockPanel.appendChild(legend);
+
     overlay.appendChild(main);
     overlay.appendChild(clockPanel);
     document.body.appendChild(overlay);
@@ -236,6 +283,8 @@ export class HackMinigame {
     this.clockFaceEl  = clockFace;
     this.clockTimeEl  = clockTime;
     this.clockLabelEl = clockLabel;
+    this.inputRowEl   = inputRow;
+    this.hpValueEl    = hpValue;
 
     form.addEventListener('submit', e => {
       e.preventDefault();
@@ -255,12 +304,42 @@ export class HackMinigame {
 
   // ── Public ────────────────────────────────────────────────────────────────
 
-  open() {
+  open(difficulty, opts = {}) {
     if (this.active) return;
+    if (typeof difficulty === 'number') {
+      this.difficulty = Math.max(MIN_DIFFICULTY, Math.min(MAX_DIFFICULTY, difficulty | 0));
+    }
+    // Outcome callbacks — the host uses these to apply the hack-link effect
+    // only when the player actually breaches the target.
+    this._onClose = typeof opts.onClose === 'function' ? opts.onClose : null;
     this.active = true;
+    this.awaitingDismiss = false;
     this.overlay.style.display = 'flex';
     this._reset();
+    this._updateHPDisplay();
     setTimeout(() => this.inputEl.focus(), 30);
+  }
+
+  _updateHPDisplay() {
+    // Re-query each call so a stale reference (e.g. if the host ever rebuilds
+    // the panel) never gets in the way of an HP update.
+    const el = this.hpValueEl || document.getElementById('hack-hp-value');
+    if (el) el.textContent = String(this._getHP());
+  }
+
+  // Charge `cost` hack points for a premium action. Returns true on success,
+  // false (and prints an error) if the player doesn't have enough HP.
+  _chargeHP(cost, label) {
+    const cur = this._getHP();
+    if (cur < cost) {
+      this._appendLines([
+        `<span class="hk-err">fault :: insufficient hack points — [${label}] needs ${cost}, have ${cur}</span>`,
+      ]);
+      return false;
+    }
+    this._spendHP(cost);
+    this._updateHPDisplay();
+    return true;
   }
 
   close() {
@@ -268,6 +347,12 @@ export class HackMinigame {
     this.overlay.style.display = 'none';
     if (this.outputTimer) { clearInterval(this.outputTimer); this.outputTimer = null; }
     if (this.clockTimer)  { clearInterval(this.clockTimer);  this.clockTimer  = null; }
+    // Fire the host callback once with the final outcome, then clear it so
+    // it can't re-trigger on a subsequent abort.
+    const cb = this._onClose;
+    const won = !!this.won;
+    this._onClose = null;
+    if (cb) cb(won);
   }
 
   // ── Clock ─────────────────────────────────────────────────────────────────
@@ -285,8 +370,12 @@ export class HackMinigame {
 
   _timeUp() {
     this.gameOver = true;
+    this.awaitingDismiss = true;
     if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null; }
-    this._appendDump([`<span class="hk-err">-- TIME EXCEEDED // trace locked // session terminated --</span>`]);
+    this._appendLines([
+      `<span class="hk-err">-- TIME EXCEEDED // trace locked // session terminated --</span>`,
+      `<span class="hk-dim">close terminal? (y/n)</span>`,
+    ]);
   }
 
   _updateClock() {
@@ -298,6 +387,7 @@ export class HackMinigame {
     this.clockTimeEl.textContent = `0x${secs.toString(16).padStart(2, '0')}`;
     this.clockTimeEl.style.color = col;
     this.clockLabelEl.style.color = isRed ? '#ff3333' : '#2a7a3a';
+    if (this.inputRowEl) this.inputRowEl.classList.toggle('danger', isRed);
   }
 
   _renderClockFace() {
@@ -327,9 +417,11 @@ export class HackMinigame {
   // ── Board generation ──────────────────────────────────────────────────────
 
   _reset() {
-    this.depth    = 0;
-    this.gameOver = false;
-    this.won      = false;
+    this.depth           = 0;
+    this.gameOver        = false;
+    this.won             = false;
+    this.awaitingDismiss = false;
+    this.winRoute        = null;
     this.outputEl.innerHTML = '';
     this.outputQueue = [];
     if (this.outputTimer) { clearInterval(this.outputTimer); this.outputTimer = null; }
@@ -342,11 +434,18 @@ export class HackMinigame {
     this._updateStatus();
     this._startClock();
     this._appendDump([
-      `<span class="hk-ok">-- NanoHacker v1.0 | breach initiated | target: ${this.targetAddr} --</span>`,
+      `<span class="hk-ok">-- NanoHacker v1.0 | lvl ${this.difficulty} | breach initiated | target: ${this.targetAddr} --</span>`,
     ]);
   }
 
   _generateBoard() {
+    // Difficulty = minimum number of path nodes on the shortest route. The
+    // board is sized to comfortably host that many nodes. 5 rows is enough
+    // for all difficulties (up to 9) because we can snake via vertical hops.
+    const diff = Math.max(MIN_DIFFICULTY, Math.min(MAX_DIFFICULTY, this.difficulty | 0 || 3));
+    ROWS = 5;
+    COLS = Math.max(15, diff * 4 + 8); // room for ~diff nodes + target band
+
     // Fill with walls
     this.board = Array.from({ length: ROWS }, () =>
       Array.from({ length: COLS }, () => ({
@@ -357,42 +456,16 @@ export class HackMinigame {
 
     const pathNodes = [];
 
-    // Gather the values of path/target neighbors (4-adjacent)
-    const adjPathValues = (r, c) => {
-      const vals = new Set();
-      for (const d of DIRS) {
-        const nr = r + d.dr, nc = c + d.dc;
-        if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
-        const cell = this.board[nr][nc];
-        if (cell.type === 'path' && cell.value !== 0) vals.add(cell.value);
-      }
-      return vals;
-    };
-
-    // Pick a value in [-9, 9] \ {0} not already used by an adjacent path node.
-    const pickValue = (forbidden) => {
-      const pool = [];
-      for (let v = -9; v <= 9; v++) {
-        if (v === 0) continue;
-        if (forbidden.has(v)) continue;
-        pool.push(v);
-      }
-      if (!pool.length) return (Math.random() < 0.5 ? -1 : 1);
-      return pool[Math.floor(Math.random() * pool.length)];
-    };
-
     const placePath = (r, c, forceValue = null) => {
-      if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return;
+      if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return false;
       const existing = this.board[r][c];
-      if (existing.type === 'path' || existing.type === 'target') return;
-      const value = forceValue !== null
-        ? forceValue
-        : pickValue(adjPathValues(r, c));
+      if (existing.type === 'path' || existing.type === 'target') return false;
+      const value = forceValue !== null ? forceValue : this._pickRandomPathValue(r, c);
       this.board[r][c] = { type: 'path', value };
       pathNodes.push({ row: r, col: c });
+      return true;
     };
 
-    // IP-fragment style: 2-digit number 10..99
     const placeConn = (r, c) => {
       if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return;
       if (this.board[r][c].type !== 'wall') return;
@@ -400,80 +473,62 @@ export class HackMinigame {
       this.board[r][c] = { type: 'conn', value: 0, ip };
     };
 
-    // Horizontal corridor between (r, c1) and (r, c2), exclusive of endpoints
     const carveH = (r, c1, c2) => {
       const minC = Math.min(c1, c2), maxC = Math.max(c1, c2);
       for (let c = minC + 1; c < maxC; c++) placeConn(r, c);
     };
 
-    // Cursor starts at left edge, centre row; its cell begins at value 0
+    // Cursor start — always leftmost, centre row.
     const startRow = Math.floor(ROWS / 2);
     const startCol = 1;
     placePath(startRow, startCol, 0);
     this.cursor = { row: startRow, col: startCol };
 
-    // ── Main route: horizontal progression with occasional vertical hops
+    // ── Difficulty-driven main route: advance east, placing exactly `diff`
+    // path nodes (the start counts as the first). A vertical hop is just a
+    // column-preserving detour via a filler + node — uses no horizontal space.
     let cr = startRow, cc = startCol;
-    while (cc < COLS - 5) {
-      const dist = 2 + Math.floor(Math.random() * 4); // 2-5 cols
-      const nc   = Math.min(COLS - 4, cc + dist);
-      if (nc === cc) break;
+    let placed = 1;
+
+    const tryVerticalHop = () => {
+      const dirChoices = [-1, 1].filter(dr => {
+        const midR = cr + dr, endR = cr + 2 * dr;
+        return midR >= 0 && midR < ROWS && endR >= 0 && endR < ROWS &&
+               this.board[midR][cc].type === 'wall' &&
+               this.board[endR][cc].type === 'wall';
+      });
+      if (!dirChoices.length) return false;
+      const dr   = dirChoices[Math.floor(Math.random() * dirChoices.length)];
+      const midR = cr + dr, endR = cr + 2 * dr;
+      placeConn(midR, cc);
+      placePath(endR, cc);
+      cr = endR;
+      return true;
+    };
+
+    while (placed < diff) {
+      // Decide: vertical hop (same column, cheap on space) or east stride.
+      // Remaining horizontal room decides — save 6 cols for the target band.
+      const eastRoom = COLS - 5 - cc;
+      const goVertical = eastRoom < 4 || Math.random() < 0.35;
+      if (goVertical && tryVerticalHop()) { placed++; continue; }
+
+      // East stride of 3-4 cols
+      const hop = 3 + Math.floor(Math.random() * 2);
+      const nc  = cc + hop;
+      if (nc > COLS - 5) break;
       carveH(cr, cc, nc);
-      placePath(cr, nc);
-      cc = nc;
-
-      // Occasionally hop to adjacent row (numbered node, no vertical conn)
-      if (Math.random() < 0.45) {
-        const dr = Math.random() < 0.5 ? -1 : 1;
-        const nr = Math.max(0, Math.min(ROWS - 1, cr + dr));
-        if (nr !== cr) { placePath(nr, cc); cr = nr; }
-      }
+      if (placePath(cr, nc)) { cc = nc; placed++; }
+      else break;
     }
 
-    // ── Horizontal spurs
-    const spurCount = 6 + Math.floor(Math.random() * 4);
-    for (let s = 0; s < spurCount; s++) {
-      if (pathNodes.length < 2) break;
-      const anchor = pathNodes[1 + Math.floor(Math.random() * (pathNodes.length - 1))];
-      const dir  = Math.random() < 0.5 ? -1 : 1;
-      const len  = 2 + Math.floor(Math.random() * 5);
-      const endC = Math.max(1, Math.min(COLS - 2, anchor.col + dir * len));
-      if (endC === anchor.col) continue;
-      const minC = Math.min(anchor.col, endC), maxC = Math.max(anchor.col, endC);
-      let clear = true;
-      for (let c = minC + 1; c <= maxC; c++) {
-        const t = this.board[anchor.row][c].type;
-        if (t === 'path' || t === 'target') { clear = false; break; }
-      }
-      if (!clear) continue;
-      carveH(anchor.row, anchor.col, endC);
-      placePath(anchor.row, endC);
-    }
+    // Last placed node is the "door" to the target.
+    const lastNode = pathNodes[pathNodes.length - 1];
+    const tRow     = lastNode.row;
+    let tStart = Math.min(lastNode.col + 2, COLS - 3);
+    if (tStart <= lastNode.col) tStart = lastNode.col + 2;
+    carveH(tRow, lastNode.col, tStart);
 
-    // ── Vertical stubs (single stacked numbered node — no vertical conn)
-    const stubCount = 3 + Math.floor(Math.random() * 3);
-    for (let s = 0; s < stubCount; s++) {
-      const anchor = pathNodes[Math.floor(Math.random() * pathNodes.length)];
-      const dr = Math.random() < 0.5 ? -1 : 1;
-      const nr = anchor.row + dr;
-      if (nr < 0 || nr >= ROWS) continue;
-      if (this.board[nr][anchor.col].type === 'wall') placePath(nr, anchor.col);
-    }
-
-    // ── Target: 3-cell horizontal band near right edge showing hex address
-    const addrNum   = Math.floor(Math.random() * 0x1000);
-    this.targetAddr = `0x${addrNum.toString(16).padStart(3, '0')}`;
-
-    const rightSide = pathNodes.filter(p =>
-      p.col >= COLS - 8 && !(p.row === startRow && p.col === startCol));
-    const baseT = rightSide[Math.floor(Math.random() * rightSide.length)]
-      ?? pathNodes[pathNodes.length - 1];
-
-    let tRow = baseT.row, tStart = baseT.col;
-    if (tStart + 2 > COLS - 1) tStart = Math.max(1, baseT.col - 2);
-
-    // Target cells carry value 1 (not 0) so shoot-through scans stop at the
-    // band — the player lands a win by zeroing any of the 3 chunks.
     for (let k = 0; k < 3; k++) {
       const c = tStart + k;
       if (c < 0 || c >= COLS) continue;
@@ -481,6 +536,56 @@ export class HackMinigame {
     }
     this.targetCell  = { row: tRow, col: tStart };
     this.targetWidth = 3;
+
+    // ── Spurs & stubs for variety. Only the cells actually overwritten need
+    //    to be walls; a spur may occasionally brush against the main route
+    //    and create a shortcut, which is fine — the player gets the odd
+    //    lucky break and the maze feels more organic.
+    const allWallsAt = (r, c) =>
+      r >= 0 && r < ROWS && c >= 0 && c < COLS &&
+      this.board[r][c].type === 'wall';
+
+    const tryHorizontalSpur = () => {
+      if (pathNodes.length < 2) return false;
+      const anchor = pathNodes[1 + Math.floor(Math.random() * (pathNodes.length - 1))];
+      const dir    = Math.random() < 0.5 ? -1 : 1;
+      const len    = 2 + Math.floor(Math.random() * 4);
+      const endC   = anchor.col + dir * len;
+      if (endC < 1 || endC >= COLS - 1) return false;
+      const minC = Math.min(anchor.col, endC) + 1;
+      const maxC = Math.max(anchor.col, endC);
+      // Only require the spur's own cells are walls — don't care what's above
+      // or below.
+      for (let c = minC; c <= maxC; c++) {
+        if (!allWallsAt(anchor.row, c)) return false;
+      }
+      carveH(anchor.row, anchor.col, endC);
+      placePath(anchor.row, endC);
+      return true;
+    };
+
+    const tryVerticalStub = () => {
+      const anchor = pathNodes[Math.floor(Math.random() * pathNodes.length)];
+      const dr   = Math.random() < 0.5 ? -1 : 1;
+      const midR = anchor.row + dr;
+      const endR = anchor.row + 2 * dr;
+      if (!allWallsAt(midR, anchor.col) || !allWallsAt(endR, anchor.col)) return false;
+      placeConn(midR, anchor.col);
+      placePath(endR, anchor.col);
+      return true;
+    };
+
+    const wantSpurs = 3 + Math.floor(Math.random() * 3);
+    const wantStubs = 2 + Math.floor(Math.random() * 2);
+    for (let s = 0, tries = 0; s < wantSpurs && tries < 20; tries++) {
+      if (tryHorizontalSpur()) s++;
+    }
+    for (let s = 0, tries = 0; s < wantStubs && tries < 20; tries++) {
+      if (tryVerticalStub()) s++;
+    }
+
+    const addrNum   = Math.floor(Math.random() * 0x1000);
+    this.targetAddr = `0x${addrNum.toString(16).padStart(3, '0')}`;
 
     this.rowPfx = Array.from({ length: ROWS }, (_, ri) => padPfx(ri));
   }
@@ -556,9 +661,20 @@ export class HackMinigame {
   }
 
   _makeRoutine() {
-    // Pick among: sudo del N | exec ±N
+    // Reseed is niche — only for breaking out when locked 0-cells exist
+    // between hops. 10 % chance and never duplicated in the slot pool.
+    const hasReseed = this.availableCommands.some(c => c && c.type === 'reseed');
+    if (!hasReseed && Math.random() < 0.10) {
+      return {
+        kind:    'routine',
+        type:    'reseed',
+        cmdFull: 'reseed 0',
+        desc:    'reseed every locked 0-cell with fresh values',
+      };
+    }
+
+    // Half of the remaining routines are sudo del N, the rest are exec ±N.
     if (Math.random() < 0.5) {
-      // sudo del N — zero every cell where value === N
       const present = new Set();
       for (let r = 0; r < ROWS; r++) {
         for (let c = 0; c < COLS; c++) {
@@ -567,17 +683,18 @@ export class HackMinigame {
         }
       }
       const arr = [...present];
-      if (!arr.length) return null;
-      const n = arr[Math.floor(Math.random() * arr.length)];
-      return {
-        kind:    'routine',
-        type:    'del',
-        n,
-        cmdFull: `sudo del ${n}`,
-        desc:    `priv esc :: drop nodes where v=${n}`,
-      };
+      if (arr.length) {
+        const n = arr[Math.floor(Math.random() * arr.length)];
+        return {
+          kind:    'routine',
+          type:    'del',
+          n,
+          cmdFull: `sudo del ${n}`,
+          desc:    `priv esc :: drop nodes where v=${n}`,
+        };
+      }
     }
-    const mag   = 1 + Math.floor(Math.random() * 3); // 1..3
+    const mag   = 1 + Math.floor(Math.random() * 3);
     const sign  = Math.random() < 0.5 ? -1 : 1;
     const delta = sign * mag;
     return {
@@ -590,19 +707,36 @@ export class HackMinigame {
   }
 
   _runCommand(raw) {
+    const input = raw.trim().toLowerCase();
+
+    // After a win or timeout we wait for the player to confirm the dismissal.
+    // Only "y" / "yes" closes; anything else gets a hacker brush-off and the
+    // prompt comes back.
+    if (this.awaitingDismiss) {
+      if (input === 'y' || input === 'yes') {
+        this.close();
+        return;
+      }
+      this._appendLines([
+        `<span class="hk-err">connection lost :: this terminal is not wired to anything any more</span>`,
+        `<span class="hk-dim">close terminal? (y/n)</span>`,
+      ]);
+      return;
+    }
+
     if (this.gameOver) {
       this._appendLines([`<span class="hk-err">session closed :: type <b>reset</b> to reboot</span>`]);
       return;
     }
-    const input = raw.trim().toLowerCase();
     if (!input) { this._appendLines(['empty packet ignored']); return; }
 
     if (input === 'reset' || input === 'reboot') {
       this.run++; this._reset(); return;
     }
 
-    // Regenerate every function slot with fresh options. Costs one turn.
+    // Regenerate every function slot with fresh options. Costs 1 hack point.
     if (input === 'cls') {
+      if (!this._chargeHP(1, 'cls')) return;
       this.depth++;
       this._refreshCommands();
       this._updateStatus();
@@ -612,10 +746,24 @@ export class HackMinigame {
       return;
     }
 
-    // Pure numeric shortcut "1", "2", "3", "4"
+    // Overclock the breach timer: +60 seconds, costs 2 hack points.
+    if (input === 'overclock') {
+      if (!this._chargeHP(2, 'overclock')) return;
+      this.depth++;
+      this.timeLeft += 60;
+      this._updateClock();
+      this._updateStatus();
+      this._appendDump([
+        `<span class="hk-ok">-- chrono overclock // +60s injected into breach loop --</span>`,
+      ]);
+      return;
+    }
+
+    // Pure numeric shortcut "1".."9" — quick-access a slot, costs 1 hack point.
     if (/^[1-9]$/.test(input)) {
       const idx = parseInt(input, 10) - 1;
       if (idx >= 0 && idx < this.availableCommands.length) {
+        if (!this._chargeHP(1, `fn[${idx + 1}]`)) return;
         this._applyCommand(this.availableCommands[idx]);
         return;
       }
@@ -631,6 +779,7 @@ export class HackMinigame {
   _applyCommand(cmd) {
     this.depth++;
     const usedIdx = this.availableCommands.indexOf(cmd);
+    const prevCursor = { row: this.cursor.row, col: this.cursor.col };
 
     if (cmd.kind === 'patch') {
       // Apply delta only to the cursor's DIRECT graph neighbours — path or
@@ -650,28 +799,49 @@ export class HackMinigame {
         this._cascadeCursor();
       }
     } else if (cmd.kind === 'routine') {
-      if (cmd.type === 'del')   this._routineDelete(cmd.n);
-      if (cmd.type === 'shift') this._routineShift(cmd.delta);
+      if (cmd.type === 'del')    this._routineDelete(cmd.n);
+      if (cmd.type === 'shift')  this._routineShift(cmd.delta);
+      if (cmd.type === 'reseed') this._routineReseed();
       this._cascadeCursor();
     }
 
-    // Win check before reassignment (winning ends the turn)
+    // Win check: cursor is on a target cell, OR any target chunk is a direct
+    // graph-neighbour of the cursor (cursor reached a node wired to memory).
     const t = this.targetCell;
-    if (this.cursor.row === t.row &&
-        this.cursor.col >= t.col && this.cursor.col < t.col + this.targetWidth) {
+    const inBand = (r, c) =>
+      r === t.row && c >= t.col && c < t.col + this.targetWidth;
+    const won =
+      inBand(this.cursor.row, this.cursor.col) ||
+      this._directlyConnectedNodes().some(n => inBand(n.r, n.c));
+    if (won) {
       this.gameOver = true; this.won = true;
+      this.awaitingDismiss = true;
       if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null; }
-      this._appendDump([
+      if (this.inputRowEl)   this.inputRowEl.classList.remove('danger');
+      if (this.clockFaceEl)  this.clockFaceEl.style.color = '#44ff88';
+      if (this.clockTimeEl)  this.clockTimeEl.style.color = '#44ff88';
+      if (this.clockLabelEl) this.clockLabelEl.style.color = '#2a7a3a';
+      // Compute the cursor→target connection so every cell on it can render
+      // in the success cyan alongside the banner.
+      this.winRoute = this._findWinRoute();
+      const sepLen = PREFIX_W + COLS * CELL_W;
+      const sep    = '\u2500'.repeat(sepLen);
+      this._appendLines([
+        `<span class="hk-dim">:: trace ${String(this.run).padStart(2, '0')}.${String(this.depth).padStart(3, '0')} :: final state ::</span>`,
+        ...this._makeBoardLines(),
+        `<span class="hk-sep">${this._esc(sep)}</span>`,
         `<span class="hk-ok">-- ACCESS GRANTED // ${this.targetAddr} compromised // returning --</span>`,
+        `<span class="hk-dim">close terminal? (y/n)</span>`,
       ]);
-      setTimeout(() => this.close(), 2800);
       return;
     }
 
-    // Between node hops: reassign every 0-value path cell (except the cursor's
-    // current cell) to a fresh random non-zero number. Numbers the player
-    // hasn't touched keep their values.
-    this._reassignZeroPaths();
+    // On a jump (cursor actually moved), every 0-cell in the whole maze —
+    // including locked / disconnected combos — gets rerandomised. When the
+    // cursor stayed put nothing resets.
+    const cursorMoved = this.cursor.row !== prevCursor.row ||
+                        this.cursor.col !== prevCursor.col;
+    if (cursorMoved) this._reassignZeroPaths();
 
     // Replace only the slot that was just used — the other functions persist.
     if (usedIdx >= 0) {
@@ -682,15 +852,18 @@ export class HackMinigame {
     this._appendDump();
   }
 
-  // Pick a non-zero value in [-9, 9] that isn't shared with 4-adjacent nodes.
+  // Pick a non-zero value in [-9, 9] enforcing the sibling rule: for every
+  // node Y that would be a graph-neighbour of (r, c), none of Y's OTHER
+  // neighbours may share the chosen value. Otherwise, patching Y with the
+  // common delta would zero multiple siblings at once and make the player's
+  // intent ambiguous. Target cells are exempt (their value is structural).
   _pickRandomPathValue(r, c) {
     const forbidden = new Set();
-    for (const d of DIRS) {
-      const nr = r + d.dr, nc = c + d.dc;
-      if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
-      const n = this.board[nr][nc];
-      if ((n.type === 'path' || n.type === 'target') && n.value !== 0) {
-        forbidden.add(n.value);
+    for (const y of this._nodeNeighbors(r, c)) {
+      for (const z of this._nodeNeighbors(y.r, y.c)) {
+        if (z.r === r && z.c === c) continue; // skip self
+        const zCell = this.board[z.r][z.c];
+        if (zCell.type === 'path' && zCell.value !== 0) forbidden.add(zCell.value);
       }
     }
     const pool = [];
@@ -704,19 +877,29 @@ export class HackMinigame {
   }
 
   _reassignZeroPaths() {
-    // Only reassign the 0-cells that are DIRECTLY connected to the cursor
-    // (graph neighbours). Everything further is preserved as latent combos.
-    const directSet = new Set();
-    for (const n of this._directlyConnectedNodes()) {
-      directSet.add(`${n.r},${n.c}`);
-    }
+    // Every 0-path cell in the WHOLE maze gets a fresh random value — both
+    // the chain the cursor just cascaded through AND any locked 0-cells
+    // sitting elsewhere. Called after a hop so combos don't persist forever.
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
         if (r === this.cursor.row && c === this.cursor.col) continue;
         const cell = this.board[r][c];
-        if (cell.type !== 'path') continue;
-        if (cell.value !== 0) continue;
-        if (!directSet.has(`${r},${c}`)) continue;
+        if (cell.type !== 'path' || cell.value !== 0) continue;
+        cell.value = this._pickRandomPathValue(r, c);
+      }
+    }
+  }
+
+  // Global reseed: every 0-path cell in the maze gets a fresh random value,
+  // including the "locked" ones that are walled off from the cursor. This
+  // is the player's escape hatch when an isolated 0-chain is blocking
+  // progress or when they want to break a stalemate.
+  _routineReseed() {
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (r === this.cursor.row && c === this.cursor.col) continue;
+        const cell = this.board[r][c];
+        if (cell.type !== 'path' || cell.value !== 0) continue;
         cell.value = this._pickRandomPathValue(r, c);
       }
     }
@@ -749,37 +932,28 @@ export class HackMinigame {
     }
   }
 
-  // A step is valid only when it follows the user's connection rules:
-  //   · path ↔ path     any direction (horizontal or vertical)
-  //   · path ↔ conn     horizontal only
-  //   · conn ↔ conn     horizontal only (a filler row is a horizontal corridor)
-  //   · path ↔ target   any direction
-  // Walls always block. Anything vertical involving a conn cell is forbidden.
+  // Any non-wall cell is reachable from any other non-wall cell, horizontally
+  // or vertically — filler corridors can now run in either axis.
   _isValidStep(curCell, d, nCell) {
-    if (nCell.type === 'wall') return false;
-    if (d.dr !== 0) {
-      if (curCell.type === 'conn' || nCell.type === 'conn') return false;
-    }
-    return true;
+    return nCell.type !== 'wall';
   }
 
-  // Direct graph neighbours of the cursor: path/target cells reached by
-  //   (a) direct 4-adjacency, or
-  //   (b) a single corridor of filler conn cells (no intermediate nodes).
-  // A BFS expands through conn cells (transit), but STOPS at any path/target
-  // cell — so connectivity is exactly one graph-hop from the cursor.
-  _directlyConnectedNodes() {
+  // Direct graph neighbours of an arbitrary cell (r, c). A BFS expands through
+  // conn cells (transit) but STOPS at every path/target cell, so connectivity
+  // is exactly one graph-hop from (r, c). The starting cell itself isn't
+  // required to be a path — a to-be-placed wall slot works too, because the
+  // step filter ignores start's type and always gates on `_isValidStep`.
+  _nodeNeighbors(r, c) {
     const nodes = [];
     const seen = new Set();
     const key = (r, c) => `${r},${c}`;
-    const start = { r: this.cursor.row, c: this.cursor.col };
-    seen.add(key(start.r, start.c));
-    const q = [start];
+    seen.add(key(r, c));
+    const q = [{ r, c }];
     while (q.length) {
-      const { r, c } = q.shift();
-      const cur = this.board[r][c];
+      const { r: rr, c: cc } = q.shift();
+      const cur = this.board[rr][cc];
       for (const d of DIRS) {
-        const nr = r + d.dr, nc = c + d.dc;
+        const nr = rr + d.dr, nc = cc + d.dc;
         if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
         const k = key(nr, nc);
         if (seen.has(k)) continue;
@@ -787,13 +961,59 @@ export class HackMinigame {
         if (!this._isValidStep(cur, d, nCell)) continue;
         seen.add(k);
         if (nCell.type === 'conn') {
-          q.push({ r: nr, c: nc }); // filler corridor — keep walking
+          q.push({ r: nr, c: nc });
         } else if (nCell.type === 'path' || nCell.type === 'target') {
-          nodes.push({ r: nr, c: nc }); // graph neighbour, do NOT recurse
+          nodes.push({ r: nr, c: nc });
         }
       }
     }
     return nodes;
+  }
+
+  _directlyConnectedNodes() {
+    return this._nodeNeighbors(this.cursor.row, this.cursor.col);
+  }
+
+  // Shortest cell-by-cell path from the cursor to any target-band cell,
+  // walking only through non-wall cells. Used to highlight the hacked
+  // connection in success cyan when the run ends.
+  _findWinRoute() {
+    const set    = new Set();
+    const target = this.targetCell;
+    const inBand = (r, c) =>
+      r === target.row && c >= target.col && c < target.col + this.targetWidth;
+    const key = (r, c) => `${r},${c}`;
+
+    const startKey = key(this.cursor.row, this.cursor.col);
+    const visited  = new Set([startKey]);
+    const parent   = new Map();
+    const q        = [{ r: this.cursor.row, c: this.cursor.col }];
+
+    while (q.length) {
+      const cur = q.shift();
+      if (inBand(cur.r, cur.c)) {
+        let k = key(cur.r, cur.c);
+        while (k !== undefined) {
+          set.add(k);
+          k = parent.get(k);
+        }
+        return set;
+      }
+      for (const d of DIRS) {
+        const nr = cur.r + d.dr, nc = cur.c + d.dc;
+        if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
+        const k = key(nr, nc);
+        if (visited.has(k)) continue;
+        if (this.board[nr][nc].type === 'wall') continue;
+        visited.add(k);
+        parent.set(k, key(cur.r, cur.c));
+        q.push({ r: nr, c: nc });
+      }
+    }
+    // Cursor might already be on the target band — include all band cells.
+    for (let k = 0; k < this.targetWidth; k++) set.add(key(target.row, target.col + k));
+    set.add(startKey);
+    return set;
   }
 
   // Cascade through every 4-adjacent 0-value non-wall cell — path, conn, AND
@@ -840,23 +1060,28 @@ export class HackMinigame {
     const isCursor = this.cursor.row === row && this.cursor.col === col;
     if (isCursor) return `<span class="hk-cursor">${'0'.padEnd(CELL_W)}</span>`;
 
+    // Highlight the winning cursor→target route in success cyan.
+    const onWinRoute = this.winRoute && this.winRoute.has(`${row},${col}`);
+
     if (cell.type === 'target') {
       const chunk = cell.chunk ?? 0;
       const start = chunk * CELL_W;
       const text  = this.targetAddr.slice(start, start + CELL_W).padEnd(CELL_W);
-      return `<span class="hk-target">${this._esc(text)}</span>`;
+      const cls   = onWinRoute ? 'hk-winroute' : 'hk-target';
+      return `<span class="${cls}">${this._esc(text)}</span>`;
     }
 
     if (cell.type === 'path') {
       const v = cell.value;
-      if (v === 0) return `<span class="hk-zero">${' 0'}</span>`;
-      // Right-align: positive "3" → " 3", negative "-3" → "-3"; digits align
+      if (v === 0) return `<span class="${onWinRoute ? 'hk-winroute' : 'hk-zero'}">${' 0'}</span>`;
       const text = String(v).padStart(CELL_W);
-      return `<span class="${v < 0 ? 'hk-neg' : 'hk-num'}">${text}</span>`;
+      const cls  = onWinRoute ? 'hk-winroute' : (v < 0 ? 'hk-neg' : 'hk-num');
+      return `<span class="${cls}">${text}</span>`;
     }
 
     if (cell.type === 'conn') {
-      return `<span class="hk-conn">${this._esc(cell.ip.slice(0, CELL_W).padEnd(CELL_W))}</span>`;
+      const cls = onWinRoute ? 'hk-winroute' : 'hk-conn';
+      return `<span class="${cls}">${this._esc(cell.ip.slice(0, CELL_W).padEnd(CELL_W))}</span>`;
     }
 
     return `<span class="hk-wall">${this._esc(cell.token.slice(0, CELL_W).padEnd(CELL_W))}</span>`;

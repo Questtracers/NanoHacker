@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { generateMap, buildMapMesh, pickFloorCell, findPath, findValidFloor, pickSpreadFloorCells } from './map.js';
 import { Player } from './player.js';
 import { Enemy } from './enemy.js';
+import { Drone } from './drone.js';
 import { Bullet } from './bullet.js';
 import { DebugSystem } from './debug.js';
 import { HackMinigame } from './hack.js';
@@ -107,6 +108,11 @@ const hackMeshes = hackCells.map(cell => {
 
 function updateHacksHUD() {
   hudHacks.innerHTML = `Hacks: <b>${hacksCollected} / ${MAX_HACKS}</b>`;
+  // Keep the hack terminal's HP counter in sync with the world pool even if
+  // the terminal is already open (e.g. during debug).
+  if (hacker && typeof hacker._updateHPDisplay === 'function') {
+    hacker._updateHPDisplay();
+  }
 }
 
 // ── Enemies ──────────────────────────────────────────────────────────────────
@@ -158,10 +164,109 @@ for (let i = 0; i < enemyCount; i++) {
 const debug = new DebugSystem(scene);
 debug.buildRoutes(enemies);
 
-// Hacking minigame — R
-const hacker = new HackMinigame();
+// Hacking minigame — R. Premium in-terminal commands (cls, overclock, numeric
+// shortcuts) spend hack points from the world pool.
+const hacker = new HackMinigame({
+  getHP:   () => hacksCollected,
+  spendHP: (n) => {
+    hacksCollected = Math.max(0, hacksCollected - n);
+    updateHacksHUD();
+  },
+});
+// ── Hack-link target selection & range ring ─────────────────────────────────
+const HACK_RANGE = 5.0;
+const hackRing = (() => {
+  const g = new THREE.RingGeometry(HACK_RANGE - 0.12, HACK_RANGE, 64);
+  const m = new THREE.MeshBasicMaterial({
+    color: 0x99ccff, transparent: true, opacity: 0.55, side: THREE.DoubleSide,
+  });
+  const r = new THREE.Mesh(g, m);
+  r.rotation.x = -Math.PI / 2;
+  r.position.y = 0.02;
+  r.visible = false;
+  scene.add(r);
+  return r;
+})();
+const pickRing = (() => {
+  const g = new THREE.RingGeometry(0.5, 0.72, 24);
+  const m = new THREE.MeshBasicMaterial({
+    color: 0xffcc66, transparent: true, opacity: 0.9, side: THREE.DoubleSide,
+  });
+  const r = new THREE.Mesh(g, m);
+  r.rotation.x = -Math.PI / 2;
+  r.position.y = 0.03;
+  r.visible = false;
+  scene.add(r);
+  return r;
+})();
+
+function findHackLinkTarget() {
+  let best = null, bestDist = Infinity;
+  const p = player.position;
+  for (const e of enemies.concat(drones)) {
+    if (!e.alive || e.faction === 'friendly') continue;
+    const d = Math.hypot(e.mesh.position.x - p.x, e.mesh.position.z - p.z);
+    if (d > HACK_RANGE) continue;
+    if (d < bestDist) { bestDist = d; best = e; }
+  }
+  return best;
+}
+
 window.addEventListener('keydown', e => {
-  if (e.key.toLowerCase() === 'r' && !gameOver && !hacker.active) hacker.open();
+  if (gameOver || hacker.active) return;
+  const k = e.key.toLowerCase();
+  if (k === 'r') {
+    const p = player.position;
+    // Spot A becomes a hackable objective until it's collected.
+    const spotDist = Math.hypot(p.x - spotACell.x, p.z - spotACell.y);
+    const spotInRange = !foundSpotA && spotDist < HACK_RANGE;
+    const enemyTarget = findHackLinkTarget();
+    const enemyDist = enemyTarget
+      ? Math.hypot(p.x - enemyTarget.mesh.position.x, p.z - enemyTarget.mesh.position.z)
+      : Infinity;
+
+    // Choose whichever hackable is closer.
+    let isSpot = false, target = null;
+    if (spotInRange && spotDist <= enemyDist) { isSpot = true; target = 'spot'; }
+    else if (enemyTarget)                     { target = enemyTarget; }
+
+    hackRing.position.set(p.x, 0.02, p.z);
+    hackRing.visible = true;
+    if (!target) {
+      setTimeout(() => { hackRing.visible = false; }, 450);
+      return;
+    }
+
+    if (isSpot) pickRing.position.set(spotACell.x, 0.03, spotACell.y);
+    else        pickRing.position.set(target.mesh.position.x, 0.03, target.mesh.position.z);
+    pickRing.visible = true;
+
+    // Difficulty: debug shortcut overrides everything; otherwise per-target.
+    let diff;
+    if (debug.enabled)            diff = 2;
+    else if (isSpot)              diff = 7;
+    else if (target instanceof Drone) diff = 3;
+    else                           diff = 5;
+
+    hacker.open(diff, {
+      onClose: (won) => {
+        hackRing.visible = false;
+        pickRing.visible = false;
+        if (!won) return;
+        if (isSpot) {
+          foundSpotA = true;
+          spotAMarker.visible = false;
+          exitMarker.visible  = true;
+          hudObj.innerHTML    = 'Objective: reach the <b style="color:#7f5">Exit</b>';
+        } else if (target.alive && typeof target.hackLink === 'function') {
+          target.hackLink();
+        }
+      },
+    });
+    return;
+  }
+  // 1..9 still opens a practice maze at that difficulty (debug mode pins to 2).
+  if (k >= '1' && k <= '9') hacker.open(debug.enabled ? 2 : parseInt(k, 10));
 });
 
 // ── Game state ────────────────────────────────────────────────────────────────
@@ -170,9 +275,84 @@ let battleMode  = false;
 let foundSpotA  = false;
 let gameOver    = false;
 
+// Gun shot — SPACE fires a bullet in the player's last-facing direction.
+// Cooldown is 5 s in stealth; in battle it only drains while the player moves
+// (same SUPERHOT rule the rest of the world obeys).
+const SHOT_COOLDOWN = 5.0;
+let   shotCooldown  = 0;
+
+const hudShot = document.getElementById('shot');
+function updateShotHUD() {
+  if (!hudShot) return;
+  hudShot.innerHTML = shotCooldown <= 0
+    ? 'Shot: <b style="color:#7ff">READY</b>'
+    : `Shot: <b>${shotCooldown.toFixed(1)}s</b>`;
+}
+
+window.addEventListener('keydown', e => {
+  if (e.key !== ' ') return;
+  if (gameOver || hacker.active) return;
+  if (shotCooldown > 0) return;
+  const d = player.facingDir;
+  const len = Math.hypot(d.x, d.z) || 1;
+  game.spawnBullet(
+    player.position.x + (d.x / len) * 0.6,
+    player.position.z + (d.z / len) * 0.6,
+    d.x / len, d.z / len,
+    'player',
+  );
+  shotCooldown = SHOT_COOLDOWN;
+  updateShotHUD();
+});
+
+// ── Drones ────────────────────────────────────────────────────────────────
+// Not spawned at start. Every time a soldier first-sees the player, a new
+// batch of 2 drones is spawned in rooms far from the player, initially
+// heading toward the room where the spot happened. Total over a run grows
+// with `timesSpotted × 2`.
+const drones       = [];
+let   timesSpotted = 0;
+
+function findRoomAt(x, z) {
+  let best = null, bestDist = Infinity;
+  for (const r of map.rooms) {
+    const d = Math.hypot(x - r.cx, z - r.cy);
+    if (d < bestDist) { bestDist = d; best = r; }
+  }
+  return best;
+}
+
+function spawnDroneBatch(spottedRoom, count = 2) {
+  if (!map.rooms?.length) return;
+  // Sort rooms by distance from player, farthest first, to place drones
+  // well away from the action.
+  const sorted = [...map.rooms].sort((a, b) =>
+    Math.hypot(b.cx - player.position.x, b.cy - player.position.z) -
+    Math.hypot(a.cx - player.position.x, a.cy - player.position.z)
+  );
+  const firstTarget = spottedRoom
+    ? { x: spottedRoom.cx, z: spottedRoom.cy }
+    : null;
+  for (let i = 0; i < count; i++) {
+    const room = sorted[i % sorted.length];
+    const pos  = findValidFloor(map, room.cx, room.cy);
+    if (!pos) continue;
+    drones.push(new Drone(scene, pos.x, pos.z, firstTarget));
+  }
+}
+
 const game = {
-  onEnemySeesPlayer() {},
-  spawnBullet(x, z, dx, dz) { bullets.push(new Bullet(scene, x, z, dx, dz)); },
+  onEnemySeesPlayer(source) {
+    // Only soldier spots trigger drone reinforcements — drones spotting the
+    // player again shouldn't snowball extra waves.
+    if (!(source instanceof Enemy)) return;
+    timesSpotted++;
+    const spottedRoom = findRoomAt(player.position.x, player.position.z);
+    spawnDroneBatch(spottedRoom, 2);
+  },
+  spawnBullet(x, z, dx, dz, owner = 'enemy') {
+    bullets.push(new Bullet(scene, x, z, dx, dz, owner));
+  },
 };
 
 function updateModeUI() {
@@ -199,7 +379,11 @@ function animate() {
 
   player.update(dt, map);
 
-  const anyAlerted = enemies.some(e => e.alive && e.alerted);
+  // Battle mode = some HOSTILE enemy is actively tracking the player. Friendly
+  // enemies fighting other hostiles don't count — the player is allied with them.
+  const anyAlerted =
+    enemies.some(e => e.alive && e.alerted && e.faction === 'hostile') ||
+    drones.some(d => d.alive && d.alerted && d.faction === 'hostile');
   if (anyAlerted !== battleMode) { battleMode = anyAlerted; updateModeUI(); }
 
   // SUPERHOT: enemies move at full speed with player, slow to 8% when player stops
@@ -210,13 +394,24 @@ function animate() {
     worldDt = dt * Math.max(ratio, 0.08); // never fully freeze — always 8% minimum
   }
 
-  for (const e of enemies) e.update(worldDt, map, player, game);
+  const worldView = { player, enemies, drones };
+  for (const e of enemies) e.update(worldDt, map, worldView, game);
+  for (const d of drones)  d.update(worldDt, map, worldView, game, time);
 
+  // Player bullets can damage both soldiers and drones.
+  const bulletTargets = enemies.concat(drones);
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
-    const r = b.update(worldDt, map, player);
+    const r = b.update(worldDt, map, player, bulletTargets);
     if (r === 'hit') return endGame('You were eliminated');
     if (!b.alive) bullets.splice(i, 1);
+  }
+
+  // Shot cooldown drains with real time in stealth, with worldDt in battle so
+  // the same SUPERHOT bargain applies (stop moving ⇒ reload crawls).
+  if (shotCooldown > 0) {
+    shotCooldown = Math.max(0, shotCooldown - (battleMode ? worldDt : dt));
+    updateShotHUD();
   }
 
   // Camera follow
@@ -243,13 +438,9 @@ function animate() {
     }
   }
 
-  // Objectives
-  if (!foundSpotA && Math.hypot(pos.x - spotACell.x, pos.z - spotACell.y) < 0.85) {
-    foundSpotA = true;
-    spotAMarker.visible = false;
-    exitMarker.visible  = true;
-    hudObj.innerHTML    = 'Objective: reach the <b style="color:#7f5">Exit</b>';
-  }
+  // Objectives — Spot A is no longer claimed by walking over it; the player
+  // must Hack-Link it (R key within HACK_RANGE, difficulty 7). The exit is
+  // still a simple walk-over once Spot A is compromised.
   if (foundSpotA && Math.hypot(pos.x - exitCell.x, pos.z - exitCell.y) < 0.85) {
     return endGame('Map cleared!');
   }
@@ -260,4 +451,5 @@ function animate() {
 
 updateModeUI();
 updateHacksHUD();
+updateShotHUD();
 animate();
