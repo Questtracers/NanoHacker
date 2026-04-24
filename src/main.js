@@ -6,6 +6,7 @@ import { Drone } from './drone.js';
 import { Bullet } from './bullet.js';
 import { DebugSystem } from './debug.js';
 import { HackMinigame } from './hack.js';
+import { showCorpLogo } from './corplogo.js';
 
 const hudMode     = document.getElementById('mode');
 const hudObj      = document.getElementById('obj');
@@ -213,11 +214,10 @@ function findHackLinkTarget() {
 }
 
 window.addEventListener('keydown', e => {
-  if (gameOver || hacker.active) return;
+  if (gameOver || hacker.active || pendingHack) return;
   const k = e.key.toLowerCase();
   if (k === 'r') {
     const p = player.position;
-    // Spot A becomes a hackable objective until it's collected.
     const spotDist = Math.hypot(p.x - spotACell.x, p.z - spotACell.y);
     const spotInRange = !foundSpotA && spotDist < HACK_RANGE;
     const enemyTarget = findHackLinkTarget();
@@ -225,7 +225,6 @@ window.addEventListener('keydown', e => {
       ? Math.hypot(p.x - enemyTarget.mesh.position.x, p.z - enemyTarget.mesh.position.z)
       : Infinity;
 
-    // Choose whichever hackable is closer.
     let isSpot = false, target = null;
     if (spotInRange && spotDist <= enemyDist) { isSpot = true; target = 'spot'; }
     else if (enemyTarget)                     { target = enemyTarget; }
@@ -241,18 +240,16 @@ window.addEventListener('keydown', e => {
     else        pickRing.position.set(target.mesh.position.x, 0.03, target.mesh.position.z);
     pickRing.visible = true;
 
-    // Difficulty: debug shortcut overrides everything; otherwise per-target.
     let diff;
-    if (debug.enabled)            diff = 2;
-    else if (isSpot)              diff = 7;
+    if (debug.enabled)               diff = 2;
+    else if (isSpot)                 diff = 7;
     else if (target instanceof Drone) diff = 3;
-    else                           diff = 5;
+    else                              diff = 5;
 
-    hacker.open(diff, {
-      onClose: (won) => {
-        hackRing.visible = false;
-        pickRing.visible = false;
-        if (!won) return;
+    const onClose = (won) => {
+      hackRing.visible = false;
+      pickRing.visible = false;
+      if (won) {
         if (isSpot) {
           foundSpotA = true;
           spotAMarker.visible = false;
@@ -261,19 +258,86 @@ window.addEventListener('keydown', e => {
         } else if (target.alive && typeof target.hackLink === 'function') {
           target.hackLink();
         }
-      },
-    });
+        return;
+      }
+      // Failed hack: 1 HP damage to the player.
+      playerTakeDamage(1);
+      if (!isSpot && target && target.alive) {
+        // Enemy becomes aware of the player — same outcome as being spotted.
+        // Snap their cone toward the player so they re-acquire line of sight
+        // immediately. Soldiers also trigger a drone reinforcement wave.
+        target.alerted          = true;
+        target.losingSightTimer = 0;
+        const ep = target.mesh.position;
+        const dx = player.position.x - ep.x;
+        const dz = player.position.z - ep.z;
+        const faceTarget = Math.atan2(dx, dz);
+        target.facing = faceTarget;
+        if ('targetFacing' in target) target.targetFacing = faceTarget;
+        if (target instanceof Enemy) {
+          game.onEnemySeesPlayer(target, player);
+        }
+      }
+    };
+
+    // Stage a pending hack so the world freezes and the lock-on ring pulses
+    // for a short beat before the terminal actually opens.
+    pendingHack = { target, isSpot, diff, onClose, startTime: performance.now() };
     return;
   }
-  // 1..9 still opens a practice maze at that difficulty (debug mode pins to 2).
   if (k >= '1' && k <= '9') hacker.open(debug.enabled ? 2 : parseInt(k, 10));
 });
+
+// Run the lock-on effect for one frame. Returns true while the pulse is still
+// ongoing (so the animate loop can skip world updates), false once the hack
+// has been handed off to the terminal.
+function tickPendingHack() {
+  if (!pendingHack) return false;
+  const elapsed  = performance.now() - pendingHack.startTime;
+  const progress = Math.min(elapsed / HACK_PREP_MS, 1);
+  // Scale pulse: outward expansion that settles back to ~1 by the end.
+  const scale   = 1 + Math.sin(progress * Math.PI) * 0.9;
+  const opacity = 0.6 + 0.4 * Math.sin(progress * Math.PI * 4);
+  pickRing.scale.setScalar(scale);
+  pickRing.material.opacity = opacity;
+  // Shift the ring colour from yellow → cyan for a "locking in" vibe.
+  const hue = 0.12 + progress * 0.35;
+  pickRing.material.color.setHSL(hue, 1, 0.6);
+  if (progress >= 1) {
+    const p = pendingHack;
+    pendingHack = null;
+    pickRing.scale.setScalar(1);
+    pickRing.material.opacity = 0.9;
+    pickRing.material.color.setHex(0xffcc66);
+    hacker.open(p.diff, { onClose: p.onClose });
+  }
+  return true;
+}
 
 // ── Game state ────────────────────────────────────────────────────────────────
 const bullets   = [];
 let battleMode  = false;
 let foundSpotA  = false;
 let gameOver    = false;
+
+// ── Player life ─────────────────────────────────────────────────────────────
+const PLAYER_MAX_HP = 2;
+let   playerHp      = PLAYER_MAX_HP;
+const hudPlayerHP   = document.getElementById('php');
+function updatePlayerHPHUD() {
+  if (hudPlayerHP) hudPlayerHP.innerHTML = `HP: <b>${playerHp} / ${PLAYER_MAX_HP}</b>`;
+}
+function playerTakeDamage(n = 1) {
+  if (gameOver) return;
+  playerHp = Math.max(0, playerHp - n);
+  updatePlayerHPHUD();
+  if (playerHp <= 0) endGame('You were eliminated');
+}
+
+// Pending hack-link: briefly freezes the world and animates the lock-on ring
+// over the target before the maze actually opens.
+const HACK_PREP_MS = 850;
+let   pendingHack  = null; // { target, isSpot, diff, onClose, startTime }
 
 // Gun shot — SPACE fires a bullet in the player's last-facing direction.
 // Cooldown is 5 s in stealth; in battle it only drains while the player moves
@@ -374,8 +438,9 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
   time += dt;
 
-  // Freeze game world while hacking
-  if (hacker.active) { renderer.render(scene, camera); return; }
+  // Pre-hack lock-on pulse freezes the world like an active hack does.
+  if (tickPendingHack()) { renderer.render(scene, camera); return; }
+  if (hacker.active)     { renderer.render(scene, camera); return; }
 
   player.update(dt, map);
 
@@ -403,7 +468,10 @@ function animate() {
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
     const r = b.update(worldDt, map, player, bulletTargets);
-    if (r === 'hit') return endGame('You were eliminated');
+    if (r === 'hit') {
+      playerTakeDamage(1);
+      if (gameOver) return;
+    }
     if (!b.alive) bullets.splice(i, 1);
   }
 
@@ -452,4 +520,7 @@ function animate() {
 updateModeUI();
 updateHacksHUD();
 updateShotHUD();
-animate();
+updatePlayerHPHUD();
+// Intro splash: shows the target corp for a few seconds before the run
+// begins, then starts the animation loop.
+showCorpLogo({ durationMs: 3500, fadeMs: 700 }, animate);

@@ -269,7 +269,9 @@ export class Drone {
     const newHp = Math.max(1, Math.floor(this.maxHp / 2));
     this.maxHp = newHp;
     this.hp    = Math.min(this.hp, newHp);
-    this.hpTimer = 4;
+    // Keep the HP bar visible for a few seconds so the player can see that
+    // their new drone ally is already half-damaged.
+    this.hpTimer = 5;
     this.hpBarBg.visible = true;
     this.hpBarFg.visible = true;
     if (this.mesh?.material) {

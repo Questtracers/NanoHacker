@@ -174,6 +174,7 @@ export class HackMinigame {
       .hk-neg     { color:#ff9944; font-weight:bold; }
       .hk-zero    { color:#77ddff; font-weight:bold; }
       .hk-trail   { color:#1e5a4a; }
+      .hk-locked  { color:#666666; }
       .hk-conn    { color:#777777; }
       .hk-target  { color:#ffcc00; font-weight:bold; }
       .hk-cursor  { background:#44ff88; color:#010a05; font-weight:bold; }
@@ -877,33 +878,33 @@ export class HackMinigame {
   }
 
   _reassignZeroPaths() {
-    // Every 0-path cell in the WHOLE maze gets a fresh random value — both
-    // the chain the cursor just cascaded through AND any locked 0-cells
-    // sitting elsewhere. Called after a hop so combos don't persist forever.
+    // Every unlocked 0-path cell in the maze gets a fresh random value.
+    // LOCKED cells stay at 0 — they represent the player's trail behind them
+    // and render as grey 0 (impassable unless the cursor is stuck).
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
         if (r === this.cursor.row && c === this.cursor.col) continue;
         const cell = this.board[r][c];
         if (cell.type !== 'path' || cell.value !== 0) continue;
+        if (cell.locked) continue;
         cell.value = this._pickRandomPathValue(r, c);
       }
     }
   }
 
-  // Global reseed: every 0-path cell in the maze gets a fresh random value,
-  // including the "locked" ones that are walled off from the cursor. This
-  // is the player's escape hatch when an isolated 0-chain is blocking
-  // progress or when they want to break a stalemate.
   _routineReseed() {
+    // Reseed honours the same exception: locked trail cells stay at 0.
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
         if (r === this.cursor.row && c === this.cursor.col) continue;
         const cell = this.board[r][c];
         if (cell.type !== 'path' || cell.value !== 0) continue;
+        if (cell.locked) continue;
         cell.value = this._pickRandomPathValue(r, c);
       }
     }
   }
+
 
   // ── Routines ──────────────────────────────────────────────────────────────
 
@@ -944,6 +945,11 @@ export class HackMinigame {
   // required to be a path — a to-be-placed wall slot works too, because the
   // step filter ignores start's type and always gates on `_isValidStep`.
   _nodeNeighbors(r, c) {
+    // Locked cells (the cursor's old positions) now behave as filler
+    // corridors — they're a transit channel that keeps connectivity alive,
+    // but the cursor can never land on them (no longer "live" nodes). So
+    // BFS keeps walking through locked cells just like through conns; only
+    // live path/target cells are returned as graph neighbours.
     const nodes = [];
     const seen = new Set();
     const key = (r, c) => `${r},${c}`;
@@ -960,7 +966,9 @@ export class HackMinigame {
         const nCell = this.board[nr][nc];
         if (!this._isValidStep(cur, d, nCell)) continue;
         seen.add(k);
-        if (nCell.type === 'conn') {
+        if (nCell.locked) {
+          q.push({ r: nr, c: nc }); // transit only, never a destination
+        } else if (nCell.type === 'conn') {
           q.push({ r: nr, c: nc });
         } else if (nCell.type === 'path' || nCell.type === 'target') {
           nodes.push({ r: nr, c: nc });
@@ -973,6 +981,8 @@ export class HackMinigame {
   _directlyConnectedNodes() {
     return this._nodeNeighbors(this.cursor.row, this.cursor.col);
   }
+
+
 
   // Shortest cell-by-cell path from the cursor to any target-band cell,
   // walking only through non-wall cells. Used to highlight the hacked
@@ -1049,6 +1059,10 @@ export class HackMinigame {
         }
       }
       if (!best) break;
+      // Lock the cell we're leaving so the player can't walk it again.
+      // Target cells are the goal and never get locked.
+      const leaving = this.board[this.cursor.row][this.cursor.col];
+      if (leaving.type === 'path') leaving.locked = true;
       this.cursor = { row: best.r, col: best.c };
       visited.add(key(best.r, best.c));
     }
@@ -1073,7 +1087,10 @@ export class HackMinigame {
 
     if (cell.type === 'path') {
       const v = cell.value;
-      if (v === 0) return `<span class="${onWinRoute ? 'hk-winroute' : 'hk-zero'}">${' 0'}</span>`;
+      if (v === 0) {
+        const cls = onWinRoute ? 'hk-winroute' : (cell.locked ? 'hk-locked' : 'hk-zero');
+        return `<span class="${cls}">${' 0'}</span>`;
+      }
       const text = String(v).padStart(CELL_W);
       const cls  = onWinRoute ? 'hk-winroute' : (v < 0 ? 'hk-neg' : 'hk-num');
       return `<span class="${cls}">${text}</span>`;
