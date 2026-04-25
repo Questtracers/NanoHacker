@@ -47,7 +47,14 @@ function makeJaggedShape(color) {
 
 // Show the corp splash, then call `onComplete` after it fades out. The caller
 // is responsible for kicking off the game's animation loop at that point.
-export function showCorpLogo({ durationMs = 3500, fadeMs = 700 } = {}, onComplete) {
+// `onSkipToDebug`, if supplied, is called instead of `onComplete` when the
+// player presses TAB during the splash — used as the entry point into the
+// character/animation debug level.
+export function showCorpLogo(
+  { durationMs = 3500, fadeMs = 700 } = {},
+  onComplete,
+  onSkipToDebug,
+) {
   const overlay = document.createElement('div');
   overlay.id = 'corplogo-overlay';
   overlay.style.cssText = `
@@ -126,14 +133,31 @@ export function showCorpLogo({ durationMs = 3500, fadeMs = 700 } = {}, onComplet
   }
   loop();
 
-  // Fade out, dispose, and hand control back to the caller.
-  setTimeout(() => {
+  // Single dismiss path — fades out, tears down the renderer + overlay, then
+  // invokes whichever exit callback the caller registered.
+  let dismissed = false;
+  function dismiss(onDone, fastFade = false) {
+    if (dismissed) return;
+    dismissed = true;
+    window.removeEventListener('keydown', onKey);
     overlay.style.opacity = '0';
+    overlay.style.transition = `opacity ${fastFade ? 200 : fadeMs}ms ease-out`;
     setTimeout(() => {
       alive = false;
       renderer.dispose();
       if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
-      if (typeof onComplete === 'function') onComplete();
-    }, fadeMs);
-  }, durationMs);
+      if (typeof onDone === 'function') onDone();
+    }, fastFade ? 200 : fadeMs);
+  }
+
+  // TAB during the splash is the secret door to the debug level.
+  function onKey(e) {
+    if (e.key !== 'Tab') return;
+    e.preventDefault();
+    dismiss(onSkipToDebug ?? onComplete, true);
+  }
+  window.addEventListener('keydown', onKey);
+
+  // Default path: dismiss after the configured duration.
+  setTimeout(() => dismiss(onComplete, false), durationMs);
 }

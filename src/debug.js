@@ -10,6 +10,7 @@ export class DebugSystem {
     this.overlay = this._makeOverlay();
 
     window.addEventListener('keydown', e => {
+      if (window.__nanoDebugLevel) return;
       if (e.key === 'Tab') { e.preventDefault(); this.toggle(); }
     });
   }

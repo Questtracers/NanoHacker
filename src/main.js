@@ -11,6 +11,7 @@ import { Rocket } from './rocket.js';
 import { DebugSystem } from './debug.js';
 import { HackMinigame } from './hack.js';
 import { showCorpLogo } from './corplogo.js';
+import { runDebugLevel } from './debug-level.js';
 
 const hudMode     = document.getElementById('mode');
 const hudObj      = document.getElementById('obj');
@@ -506,6 +507,7 @@ function findHackLinkTarget() {
 }
 
 window.addEventListener('keydown', e => {
+  if (window.__nanoDebugLevel) return;
   if (gameOver || hacker.active || pendingHack) return;
   const k = e.key.toLowerCase();
   if (k === 'r') {
@@ -727,6 +729,7 @@ function updateShotHUD() {
 }
 
 window.addEventListener('keydown', e => {
+  if (window.__nanoDebugLevel) return;
   // F → mecha rocket launcher (only valid while possessing a mecha).
   if (e.key.toLowerCase() === 'f') {
     if (gameOver || hacker.active) return;
@@ -827,6 +830,9 @@ let   time  = 0;
 
 function animate() {
   if (gameOver) return;
+  // Debug level takeover — main animate / listeners are inert while the
+  // empty test arena is running.
+  if (window.__nanoDebugLevel) return;
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
   time += dt;
@@ -971,5 +977,6 @@ updateHacksHUD();
 updateShotHUD();
 updatePlayerHPHUD();
 // Intro splash: shows the target corp for a few seconds before the run
-// begins, then starts the animation loop.
-showCorpLogo({ durationMs: 3500, fadeMs: 700 }, animate);
+// begins, then starts the animation loop. TAB during the splash diverts
+// into the empty character/animation debug level instead.
+showCorpLogo({ durationMs: 3500, fadeMs: 700 }, animate, runDebugLevel);
