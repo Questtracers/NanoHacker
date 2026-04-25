@@ -4,10 +4,10 @@ import * as THREE from 'three';
 // is approaching (≤ 1.4 cells away); player must Hack-Link to open. A hacked
 // door stays open for the rest of the run and exposes the same hack-link
 // surface as enemies (`alive`, `faction`, `mesh.position`, `hackLink()`).
-// Doors span the full 3-cell-wide corridor. The slab is thin along the
-// corridor's travel axis and 3 cells wide perpendicular.
+// Door slab dimensions. The width is now per-instance — measured against the
+// corridor at spawn so the slab actually touches both walls of any-width
+// passage rather than being a one-size-fits-all 3-cell rectangle.
 const SLAB_THICKNESS  = 0.20;
-const SLAB_WIDTH      = 2.85;
 const SLAB_HEIGHT     = 1.5;
 // Auto-open check: enemies approaching within these box bounds open the door.
 const TRIGGER_AHEAD   = 2.0; // cells along the travel axis
@@ -18,22 +18,38 @@ const PLAYER_BLOCK_TH = 0.6;
 export class Door {
   // corridorDir: 'EW' (east-west passage — slab spans N–S) or
   //              'NS' (north-south passage — slab spans E–W).
-  constructor(scene, x, z, corridorDir = 'EW') {
-    this.x          = x;
-    this.z          = z;
+  // corridorWidth: passable width perpendicular to the travel axis, in cells.
+  //                Defaults to 3 (the standard map corridor) but the spawner
+  //                measures the actual width and passes it in.
+  constructor(scene, x, z, corridorDir = 'EW', corridorWidth = 3) {
+    this.x           = x;
+    this.z           = z;
     this.corridorDir = corridorDir;
-    this.alive      = true;
-    this.faction    = 'door';   // ignored by the AI's friend/foe checks
-    this.hacked     = false;
-    this.openness   = 0;        // 0 closed → 1 fully open
-    this.scene      = scene;
+    this.alive       = true;
+    this.faction     = 'door';   // ignored by the AI's friend/foe checks
+    this.hacked      = false;
+    this.openness    = 0;
+    this.scene       = scene;
 
     const isEW = corridorDir === 'EW';
-    // EW corridor (player traverses east-west) → slab is thin in X, wide in Z
-    const w = isEW ? SLAB_THICKNESS : SLAB_WIDTH;
-    const d = isEW ? SLAB_WIDTH     : SLAB_THICKNESS;
+    // Slab fills the corridor exactly so the door touches both side walls.
+    const slabWidth = corridorWidth;
+    this.slabWidth  = slabWidth;
+    const w = isEW ? SLAB_THICKNESS : slabWidth;
+    const d = isEW ? slabWidth      : SLAB_THICKNESS;
     const h = SLAB_HEIGHT;
     this._isEW = isEW;
+
+    // Grid cells the slab occupies. When the door is closed/closing we mark
+    // these cells as walls so bullets, vision cones and pathfinding all
+    // respect the door — when it opens we set them back to floor.
+    const halfNeg = Math.floor((slabWidth - 1) / 2);
+    const halfPos = Math.ceil((slabWidth - 1) / 2);
+    this.cells = [];
+    for (let i = -halfNeg; i <= halfPos; i++) {
+      this.cells.push(isEW ? { r: z + i, c: x } : { r: z, c: x + i });
+    }
+    this._blockingMap = false; // tracked separately to avoid redundant writes
 
     const slabGeo = new THREE.BoxGeometry(w, h, d);
     const slabMat = new THREE.MeshStandardMaterial({
@@ -49,8 +65,8 @@ export class Door {
 
     // Floor strip — long marker along the corridor showing where the door is
     const stripGeo = new THREE.PlaneGeometry(
-      isEW ? 0.55 : SLAB_WIDTH,
-      isEW ? SLAB_WIDTH : 0.55,
+      isEW ? 0.55 : slabWidth,
+      isEW ? slabWidth : 0.55,
     );
     const stripMat = new THREE.MeshBasicMaterial({
       color: 0xff8866, transparent: true, opacity: 0.55, side: THREE.DoubleSide,
@@ -74,7 +90,18 @@ export class Door {
     if (!this.blocksPlayer()) return false;
     const ahead = this._isEW ? Math.abs(x - this.x) : Math.abs(z - this.z);
     const side  = this._isEW ? Math.abs(z - this.z) : Math.abs(x - this.x);
-    return ahead < 0.55 && side < SLAB_WIDTH / 2;
+    return ahead < 0.55 && side < this.slabWidth / 2;
+  }
+
+  // True if (x, z) overlaps any of this door's footprint cells. Used for
+  // bullet collision and cone ray-march early-out — both consult a global
+  // door blocker registered against the door list.
+  containsCell(x, z) {
+    const cx = Math.round(x), cz = Math.round(z);
+    for (const c of this.cells) {
+      if (c.r === cz && c.c === cx) return true;
+    }
+    return false;
   }
 
   update(dt, world) {
@@ -91,17 +118,10 @@ export class Door {
         const side  = this._isEW ? Math.abs(dz) : Math.abs(dx);
         if (ahead < TRIGGER_AHEAD && side < TRIGGER_SIDE) { target = 1; break; }
       }
-      // NEVER close on the player: if the player is currently overlapping the
-      // door footprint (including a small grace margin so the slab doesn't
-      // clip them mid-step) the door stays open until they're clear.
-      if (world.player) {
-        const px = world.player.position.x;
-        const pz = world.player.position.z;
-        const ahead = this._isEW ? Math.abs(px - this.x) : Math.abs(pz - this.z);
-        const side  = this._isEW ? Math.abs(pz - this.z) : Math.abs(px - this.x);
-        if (ahead < 0.75 && side < SLAB_WIDTH / 2 + 0.25) target = 1;
-      }
     }
+    // Player can never trigger or hold the door open. Even if they get
+    // caught mid-crossing while it closes, the host's `doorBlocksPlayer`
+    // check lets them keep moving AWAY from the slab so they're never stuck.
 
     if      (this.openness < target) this.openness = Math.min(1, this.openness + dt * ANIM_SPEED);
     else if (this.openness > target) this.openness = Math.max(0, this.openness - dt * ANIM_SPEED);

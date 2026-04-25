@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { isWall, rayMarch } from './map.js';
+import { isWall, rayMarch, findPath, findValidFloor } from './map.js';
 
 const STEALTH_CONE_ANGLE = Math.PI / 4;
 const STEALTH_CONE_RANGE = 7;
@@ -57,6 +57,11 @@ export class Enemy {
     this.alerted          = false;
     this.losingSightTimer = 0;
     this.shootCooldown    = 1.0;
+    // While alerted, the soldier follows a BFS path toward the player so it
+    // doesn't crash into walls. Recomputed periodically as the player moves.
+    this.chasePath      = null;
+    this.chasePos       = 0;
+    this.chasePathTimer = 0;
     // Burst fire: 3 bullets close together, then a longer pause.
     this.burstRemaining   = 3;
     this.burstGap         = 0.10;
@@ -291,12 +296,15 @@ export class Enemy {
       const dz   = target.pos.z - this.mesh.position.z;
       const dist = Math.hypot(dx, dz);
       this.targetFacing = Math.atan2(dx, dz);
-      if (dist > 3.5) this._tryMove(dx / dist, dz / dist, dt, map);
+      // Pathfind toward the target instead of charging straight at it. This
+      // makes the soldier round walls / corners cleanly rather than mashing
+      // into them. Path is recomputed every ~0.4 s as the player moves.
+      if (dist > 3.5) this._chaseStep(dx, dz, dist, dt, map, target.pos);
 
       this.shootCooldown -= dt;
       if (this.shootCooldown <= 0 && dist < BATTLE_CONE_RANGE) {
         const owner = this.faction === 'friendly' ? 'player' : 'enemy';
-        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, dx / dist, dz / dist, owner);
+        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, dx / dist, dz / dist, owner, this);
         this.burstRemaining--;
         if (this.burstRemaining <= 0) {
           this.burstRemaining = 3;
@@ -360,9 +368,74 @@ export class Enemy {
       }
     }
 
+    // Soft separation from other living entities so soldiers don't pile up.
+    this._avoidOthers(world, dt, map);
+
     this._smoothTurn(dt);
     this.updateConeMesh(map);
     this._updateHpBar(dt);
+  }
+
+  // Chase a moving target via a periodically-recomputed BFS path. Falls back
+  // to the old direct charge if pathfinding can't return a usable waypoint
+  // list (e.g. target snapped onto an unreachable cell).
+  _chaseStep(dx, dz, dist, dt, map, targetPos) {
+    this.chasePathTimer -= dt;
+    const needsRefresh =
+      this.chasePathTimer <= 0 ||
+      !this.chasePath ||
+      this.chasePos >= this.chasePath.length;
+    if (needsRefresh) {
+      const from = findValidFloor(map, this.mesh.position.x, this.mesh.position.z);
+      const to   = findValidFloor(map, targetPos.x, targetPos.z);
+      const path = (from && to)
+        ? findPath(map, from.x, from.z, to.x, to.z)
+        : null;
+      this.chasePath      = (path && path.length >= 1) ? path : null;
+      this.chasePos       = 0;
+      this.chasePathTimer = 0.4;
+    }
+    if (this.chasePath && this.chasePos < this.chasePath.length) {
+      const wp   = this.chasePath[this.chasePos];
+      const wdx  = wp.x - this.mesh.position.x;
+      const wdz  = wp.z - this.mesh.position.z;
+      const wd   = Math.hypot(wdx, wdz);
+      if (wd < 0.55) {
+        this.chasePos++;
+      } else {
+        this._tryMove(wdx / wd, wdz / wd, dt, map);
+      }
+      return;
+    }
+    // Fallback — direct vector at the target.
+    this._tryMove(dx / dist, dz / dist, dt, map);
+  }
+
+  // Soft repulsion from other living entities (soldiers, drones, mechas). A
+  // tiny push perpendicular to the body means crowds spread out instead of
+  // overlapping in the same cell.
+  _avoidOthers(world, dt, map) {
+    if (!world) return;
+    const groups = [world.enemies, world.drones, world.mechas].filter(Boolean);
+    let pushX = 0, pushZ = 0;
+    for (const arr of groups) {
+      for (const o of arr) {
+        if (o === this || !o || !o.alive) continue;
+        const dx = this.mesh.position.x - o.mesh.position.x;
+        const dz = this.mesh.position.z - o.mesh.position.z;
+        const d  = Math.hypot(dx, dz);
+        // Larger entities (mechas) push from a wider radius.
+        const radius = (o.hitRadius ?? 0.4) + 0.7;
+        if (d > radius || d < 0.001) continue;
+        const force = (radius - d) / radius;
+        pushX += (dx / d) * force;
+        pushZ += (dz / d) * force;
+      }
+    }
+    if (pushX !== 0 || pushZ !== 0) {
+      const mag = Math.hypot(pushX, pushZ);
+      this._tryMove(pushX / mag, pushZ / mag, dt * 0.55, map);
+    }
   }
 
   _updateHpBar(dt) {

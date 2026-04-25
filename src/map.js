@@ -80,30 +80,28 @@ export function buildMapMesh(map, scene) {
   const lowGeo  = new THREE.BoxGeometry(1, 0.5, 1);
   const lowMat  = new THREE.MeshStandardMaterial({ color: 0x6a4a2a, roughness: 0.9, emissive: 0x1a0c00 });
 
-  let wc = 0, lc = 0;
+  // Walls only — destructible obstacles (grid value 2) are now rendered by
+  // the Obstacle class as per-cell Box meshes so they can be damaged or
+  // destroyed individually.
+  let wc = 0;
   for (let y = 0; y < height; y++)
-    for (let x = 0; x < width; x++) {
-      if (grid[y][x] === 1) wc++;
-      else if (grid[y][x] === 2) lc++;
-    }
+    for (let x = 0; x < width; x++) if (grid[y][x] === 1) wc++;
 
   const walls = new THREE.InstancedMesh(wallGeo, wallMat, wc);
-  const lows  = new THREE.InstancedMesh(lowGeo,  lowMat,  lc);
   walls.castShadow = true; walls.receiveShadow = true;
-  lows.castShadow  = true; lows.receiveShadow  = true;
   const dummy = new THREE.Object3D();
-  let wi = 0, li = 0;
+  let wi = 0;
   for (let y = 0; y < height; y++)
     for (let x = 0; x < width; x++) {
       if (grid[y][x] === 1) {
         dummy.position.set(x, 0.75, y); dummy.updateMatrix();
         walls.setMatrixAt(wi++, dummy.matrix);
-      } else if (grid[y][x] === 2) {
-        dummy.position.set(x, 0.25, y); dummy.updateMatrix();
-        lows.setMatrixAt(li++, dummy.matrix);
       }
     }
-  group.add(walls); group.add(lows);
+  group.add(walls);
+  // Keep the geometry/materials around for the lows in case anything imports
+  // them — but no instances are emitted.
+  void lowGeo; void lowMat;
   scene.add(group);
   return group;
 }
@@ -115,13 +113,22 @@ export function isWall(map, x, z) {
   return map.grid[gz][gx] !== 0;
 }
 
+// Optional extra blocker (e.g. closed doors) consulted by rayMarch in addition
+// to the static map grid. Hosts register a function via `setRayBlocker` —
+// passing `null` clears it. Pathfinding (findPath) intentionally does NOT
+// consult this so AI routes can plan through doors that auto-open.
+let _rayBlocker = null;
+export function setRayBlocker(fn) { _rayBlocker = fn || null; }
+
 // Ray march for vision cone — returns distance to first obstruction
 export function rayMarch(map, ox, oz, dx, dz, maxDist) {
   const step = 0.15;
   let t = 0;
   while (t < maxDist) {
     t += step;
-    if (isWall(map, ox + dx * t, oz + dz * t)) return t - step;
+    const px = ox + dx * t, pz = oz + dz * t;
+    if (isWall(map, px, pz)) return t - step;
+    if (_rayBlocker && _rayBlocker(px, pz)) return t - step;
   }
   return maxDist;
 }

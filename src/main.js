@@ -1,9 +1,11 @@
 import * as THREE from 'three';
-import { generateMap, buildMapMesh, pickFloorCell, findPath, findValidFloor, pickSpreadFloorCells } from './map.js';
+import { generateMap, buildMapMesh, pickFloorCell, findPath, findValidFloor, pickSpreadFloorCells, setRayBlocker } from './map.js';
 import { Player } from './player.js';
 import { Enemy } from './enemy.js';
 import { Drone } from './drone.js';
 import { Door } from './door.js';
+import { Obstacle } from './obstacle.js';
+import { Mecha } from './mecha.js';
 import { Bullet } from './bullet.js';
 import { DebugSystem } from './debug.js';
 import { HackMinigame } from './hack.js';
@@ -47,6 +49,69 @@ scene.add(sun);
 // Map — ~25% larger than previous 54×54
 const map = generateMap(68, 68, 18);
 buildMapMesh(map, scene);
+
+// ── Destructible obstacles ──────────────────────────────────────────────────
+// Group adjacent grid==2 cells into Obstacle entities. Each has 2 HP and
+// renders as a per-cell Box stack via the Obstacle class.
+const obstacles      = [];
+const obstacleByCell = new Map();
+{
+  const seen = new Set();
+  for (let r = 0; r < map.height; r++) {
+    for (let c = 0; c < map.width; c++) {
+      const k = `${r},${c}`;
+      if (seen.has(k) || map.grid[r][c] !== 2) continue;
+      const cells = [];
+      const queue = [{ r, c }];
+      seen.add(k);
+      while (queue.length) {
+        const cur = queue.shift();
+        cells.push({ row: cur.r, col: cur.c });
+        for (const [dr, dc] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+          const nr = cur.r + dr, nc = cur.c + dc;
+          const nk = `${nr},${nc}`;
+          if (seen.has(nk)) continue;
+          if (nr < 0 || nr >= map.height || nc < 0 || nc >= map.width) continue;
+          if (map.grid[nr][nc] !== 2) continue;
+          seen.add(nk);
+          queue.push({ r: nr, c: nc });
+        }
+      }
+      const o = new Obstacle(scene, cells);
+      obstacles.push(o);
+      for (const cell of cells) obstacleByCell.set(`${cell.row},${cell.col}`, o);
+    }
+  }
+}
+
+function obstacleAt(x, z) {
+  return obstacleByCell.get(`${Math.round(z)},${Math.round(x)}`) || null;
+}
+
+// Drop the cells from both the index and the map grid so movement & vision
+// pass through the wreckage.
+function _retireObstacle(o) {
+  for (const c of o.cells) {
+    map.grid[c.row][c.col] = 0;
+    obstacleByCell.delete(`${c.row},${c.col}`);
+  }
+}
+
+function damageObstacleAt(x, z, n = 1) {
+  const o = obstacleAt(x, z);
+  if (!o || !o.alive) return false;
+  o.takeDamage(n);
+  if (!o.alive) _retireObstacle(o);
+  return true;
+}
+
+function destroyObstacleAt(x, z) {
+  const o = obstacleAt(x, z);
+  if (!o || !o.alive) return false;
+  o.destroy();
+  _retireObstacle(o);
+  return true;
+}
 
 // Player — spawns at a validated floor cell near first room's centre
 const startRoom  = map.rooms[0];
@@ -202,17 +267,42 @@ for (let i = 0; i < enemyCount; i++) {
   enemies.push(e);
 }
 
+// ── Mechas — heavy hostile that ignores obstacles and crushes them ─────────
+// 3 per run. Spawn on rooms far from the player, idle near their spawn until
+// alerted (line of sight or another hostile spotting nearby).
+const mechas = [];
+{
+  const sortedRooms = [...map.rooms].sort((a, b) =>
+    Math.hypot(b.cx - spawnCell.x, b.cy - spawnCell.z) -
+    Math.hypot(a.cx - spawnCell.x, a.cy - spawnCell.z)
+  );
+  let placed = 0;
+  for (const room of sortedRooms) {
+    if (placed >= 3) break;
+    const pos = findValidFloor(map, room.cx, room.cy);
+    if (!pos) continue;
+    if (Math.hypot(pos.x - spawnCell.x, pos.z - spawnCell.z) < 10) continue;
+    mechas.push(new Mecha(scene, pos.x, pos.z));
+    placed++;
+  }
+}
+
 // Debug system — TAB
 const debug = new DebugSystem(scene);
 debug.buildRoutes(enemies);
 
 // ── Doors ────────────────────────────────────────────────────────────────────
-// Doors live ONLY in the 3-cell-wide corridors that the map generator carves
-// between consecutive rooms. Each such corridor independently has a 50 % chance
-// of receiving exactly one door, placed on a corridor cell that lies outside
-// every room rectangle (so they're never confused with in-room obstacles).
+// Doors live ONLY on cells that are GEOMETRICALLY a straight corridor — i.e.
+// floor with parallel walls bracketing the passage. Orientation and width are
+// measured from the actual neighbours (not inferred from the L-path) so a
+// door can never end up on a bend, intersection, or inside a room.
 const doors = [];
 function spawnCorridorDoors() {
+  const isFloor = (x, y) =>
+    x >= 0 && y >= 0 && x < map.width && y < map.height && map.grid[y][x] === 0;
+  const isWallCell = (x, y) =>
+    x < 0 || y < 0 || x >= map.width || y >= map.height || map.grid[y][x] === 1;
+
   const isInsideAnyRoom = (x, y) => {
     for (const r of map.rooms) {
       if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return true;
@@ -220,40 +310,74 @@ function spawnCorridorDoors() {
     return false;
   };
 
+  // Walk outward along an axis until both sides hit a wall (true corridor)
+  // or we exceed the cap (open area / room). Returns lo/hi/width or null if
+  // the axis isn't tightly bounded.
+  function boundedAxis(x, y, axis) {
+    const MAX = 4;
+    let lo = 0, hi = 0;
+    const step = (n) => axis === 'Z' ? [x, y + n] : [x + n, y];
+    while (lo <= MAX) {
+      const [nx, nz] = step(-(lo + 1));
+      if (!isFloor(nx, nz)) break;
+      lo++;
+    }
+    while (hi <= MAX) {
+      const [nx, nz] = step(hi + 1);
+      if (!isFloor(nx, nz)) break;
+      hi++;
+    }
+    if (lo > MAX || hi > MAX) return null;
+    const [lx, lz] = step(-(lo + 1));
+    const [rx, rz] = step(hi + 1);
+    if (!isWallCell(lx, lz) || !isWallCell(rx, rz)) return null;
+    return { lo, hi, width: 1 + lo + hi };
+  }
+
+  // The corridor's orientation falls out of which axis is bounded:
+  //   • Z bounded + X unbounded → EW corridor (slab spans Z).
+  //   • X bounded + Z unbounded → NS corridor (slab spans X).
+  // The candidate must also sit at the geometric CENTRE (lo == hi) so the
+  // door slab — which renders symmetrically around the cell — actually
+  // covers the corridor wall-to-wall instead of leaving a gap on one side.
+  function corridorMeasure(x, y) {
+    const zw = boundedAxis(x, y, 'Z');
+    const xw = boundedAxis(x, y, 'X');
+    if (zw && !xw && zw.lo === zw.hi) return { dir: 'EW', width: zw.width };
+    if (xw && !zw && xw.lo === xw.hi) return { dir: 'NS', width: xw.width };
+    return null;
+  }
+
   for (let i = 1; i < map.rooms.length; i++) {
     if (Math.random() >= 0.5) continue; // 50 % per corridor
 
-    // Reconstruct the same L-shape the generator carved: horizontal leg first
-    // along the source room's centre row, then vertical leg up the dest col.
+    // Reconstruct the L-path the generator carved so we sample only cells
+    // on this specific corridor (instead of accidentally landing on shared
+    // corridor segments).
     const a = map.rooms[i - 1];
     const b = map.rooms[i];
     let cx = a.cx, cy = a.cy;
     const tx = b.cx, ty = b.cy;
     const path = [];
     while (cx !== tx) {
-      path.push({ x: cx, y: cy, dir: 'EW' });
+      path.push({ x: cx, y: cy });
       cx += cx < tx ? 1 : -1;
     }
     while (cy !== ty) {
-      path.push({ x: cx, y: cy, dir: 'NS' });
+      path.push({ x: cx, y: cy });
       cy += cy < ty ? 1 : -1;
     }
 
-    // Keep only true corridor cells (outside all rooms), away from spawn,
-    // not piling up on top of another door, AND on a straight stretch (skip
-    // any cell where the corridor changes direction so a door never sits on
-    // an L-bend, which would render with the slab not actually covering the
-    // passable cells).
-    const valid = path.filter((p, i) => {
-      if (isInsideAnyRoom(p.x, p.y)) return false;
-      if (Math.hypot(p.x - spawnCell.x, p.y - spawnCell.z) <= 4) return false;
-      if (doors.some(d => Math.hypot(d.x - p.x, d.z - p.y) < 3)) return false;
-      const prev = path[i - 1];
-      const next = path[i + 1];
-      if (prev && prev.dir !== p.dir) return false;
-      if (next && next.dir !== p.dir) return false;
-      return true;
-    });
+    // Filter to GEOMETRICALLY-valid corridor cells.
+    const valid = [];
+    for (const p of path) {
+      if (isInsideAnyRoom(p.x, p.y)) continue;
+      if (Math.hypot(p.x - spawnCell.x, p.y - spawnCell.z) <= 4) continue;
+      if (doors.some(d => Math.hypot(d.x - p.x, d.z - p.y) < 3)) continue;
+      const m = corridorMeasure(p.x, p.y);
+      if (!m) continue;
+      valid.push({ ...p, dir: m.dir, width: m.width });
+    }
     if (!valid.length) continue;
 
     // Pick somewhere in the middle third for a more chokepoint-y feel.
@@ -261,16 +385,40 @@ function spawnCorridorDoors() {
     const hi = Math.max(lo + 1, Math.floor(valid.length * 0.75));
     const idx = lo + Math.floor(Math.random() * (hi - lo));
     const pt  = valid[idx];
-    doors.push(new Door(scene, pt.x, pt.y, pt.dir));
+    doors.push(new Door(scene, pt.x, pt.y, pt.dir, pt.width));
   }
 }
 spawnCorridorDoors();
 
-// Returns true if a closed (and un-hacked) door overlaps the player at (x, z).
+// Returns true if a closed (and un-hacked) door would obstruct the player's
+// next position. Movement that pushes the player AWAY from the door's slab
+// axis is permitted so anyone caught mid-cross when the door closes can
+// still slip out — they just can't enter or stay put.
 function doorBlocksPlayer(x, z) {
-  for (const d of doors) if (d.blocksPlayerAt(x, z)) return true;
+  const cx = player.position.x;
+  const cz = player.position.z;
+  for (const d of doors) {
+    if (!d.blocksPlayerAt(x, z)) continue;
+    const isEW = d.corridorDir === 'EW';
+    const cur  = isEW ? Math.abs(cx - d.x) : Math.abs(cz - d.z);
+    const nxt  = isEW ? Math.abs(x - d.x)  : Math.abs(z - d.z);
+    if (nxt > cur) continue; // moving away from the slab — allowed
+    return true;
+  }
   return false;
 }
+
+// Generic door collision used by bullets and the cone ray-marcher. A closed,
+// un-hacked door treats its footprint cells as solid for bullets/vision —
+// pathfinding deliberately ignores this so AI can still route through.
+function cellBlockedByDoor(x, z) {
+  for (const d of doors) {
+    if (!d.blocksPlayer()) continue;
+    if (d.containsCell(x, z)) return true;
+  }
+  return false;
+}
+setRayBlocker(cellBlockedByDoor);
 
 // Hacking minigame — R. Premium in-terminal commands (cls, overclock, numeric
 // shortcuts) spend hack points from the world pool.
@@ -311,8 +459,9 @@ const pickRing = (() => {
 function findHackLinkTarget() {
   let best = null, bestDist = Infinity;
   const p = player.position;
-  // Soldiers + drones + un-hacked doors are all valid hack targets.
-  for (const e of enemies.concat(drones).concat(doors)) {
+  // Soldiers + drones + mechas + un-hacked doors are all valid hack targets.
+  const all = enemies.concat(drones).concat(mechas).concat(doors);
+  for (const e of all) {
     if (!e.alive || e.faction === 'friendly') continue;
     const d = Math.hypot(e.mesh.position.x - p.x, e.mesh.position.z - p.z);
     if (d > HACK_RANGE) continue;
@@ -349,11 +498,12 @@ window.addEventListener('keydown', e => {
     pickRing.visible = true;
 
     let diff;
-    if (debug.enabled)                diff = 2;
-    else if (isSpot)                  diff = 7;
-    else if (target instanceof Door)  diff = 2;
-    else if (target instanceof Drone) diff = 3;
-    else                              diff = 5;
+    if (debug.enabled)                 diff = 2;
+    else if (isSpot)                   diff = 7;
+    else if (target instanceof Door)   diff = 2;
+    else if (target instanceof Drone)  diff = 3;
+    else if (target instanceof Mecha)  diff = 7;
+    else                               diff = 5;
 
     const onClose = (won) => {
       hackRing.visible = false;
@@ -515,16 +665,19 @@ function spawnDroneBatch(spottedRoom, count = 2) {
 
 const game = {
   onEnemySeesPlayer(source) {
-    // Only soldier spots trigger drone reinforcements — drones spotting the
-    // player again shouldn't snowball extra waves.
     if (!(source instanceof Enemy)) return;
     timesSpotted++;
     const spottedRoom = findRoomAt(player.position.x, player.position.z);
     spawnDroneBatch(spottedRoom, 2);
   },
-  spawnBullet(x, z, dx, dz, owner = 'enemy') {
-    bullets.push(new Bullet(scene, x, z, dx, dz, owner));
+  spawnBullet(x, z, dx, dz, owner = 'enemy', shooter = null) {
+    bullets.push(new Bullet(scene, x, z, dx, dz, owner, shooter));
   },
+  // Helpers for obstacle / door interaction.
+  obstacleAt,
+  damageObstacleAt,
+  destroyObstacleAt,
+  cellBlockedByDoor,
 };
 
 function updateModeUI() {
@@ -556,7 +709,8 @@ function animate() {
   // enemies fighting other hostiles don't count — the player is allied with them.
   const anyAlerted =
     enemies.some(e => e.alive && e.alerted && e.faction === 'hostile') ||
-    drones.some(d => d.alive && d.alerted && d.faction === 'hostile');
+    drones.some(d => d.alive && d.alerted && d.faction === 'hostile') ||
+    mechas.some(m => m.alive && m.alerted && m.faction === 'hostile');
   if (anyAlerted !== battleMode) { battleMode = anyAlerted; updateModeUI(); }
 
   // SUPERHOT: enemies move at full speed with player, slow to 8% when player stops
@@ -567,18 +721,18 @@ function animate() {
     worldDt = dt * Math.max(ratio, 0.08); // never fully freeze — always 8% minimum
   }
 
-  const worldView = { player, enemies, drones };
+  const worldView = { player, enemies, drones, mechas, map, destroyObstacleAt };
   for (const e of enemies) e.update(worldDt, map, worldView, game);
   for (const d of drones)  d.update(worldDt, map, worldView, game, time);
-  // Doors animate at real-time speed (not SUPERHOT-modulated) so the open
-  // animation always feels responsive when an enemy approaches.
-  for (const dr of doors) dr.update(dt, worldView);
+  for (const m of mechas)  m.update(worldDt, map, worldView, game);
+  for (const dr of doors)  dr.update(dt, worldView);
 
-  // Player bullets can damage both soldiers and drones.
-  const bulletTargets = enemies.concat(drones);
+  // Player bullets can damage both soldiers and drones (and mechas, added
+  // below). Game callbacks let bullets damage obstacles on impact.
+  const bulletTargets = enemies.concat(drones).concat(mechas);
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
-    const r = b.update(worldDt, map, player, bulletTargets);
+    const r = b.update(worldDt, map, player, bulletTargets, game);
     if (r === 'hit') {
       playerTakeDamage(1);
       if (gameOver) return;

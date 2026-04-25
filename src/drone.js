@@ -54,6 +54,11 @@ export class Drone {
     this.alive   = true;
     this.alerted = false;
     this.losingSightTimer = 0;
+    // BFS pathfinding while chasing the player so the drone doesn't smear
+    // itself against walls when the player is around a corner.
+    this.chasePath      = null;
+    this.chasePos       = 0;
+    this.chasePathTimer = 0;
     this.faction = 'hostile';
     // Drones fire one shot at a time, slightly faster than soldier bursts.
     this.shootCooldown    = 0.80;
@@ -204,16 +209,18 @@ export class Drone {
       // drone is still mid-reacting to a bullet.
       if (!boosting) this.facing = Math.atan2(dx, dz);
 
-      // Chase: keep line of sight when the target tries to peel off.
+      // Chase via a periodically-refreshed BFS path so the drone rounds
+      // corners cleanly instead of pressing into walls when the player
+      // breaks line-of-sight around a turn.
       if (dist > 2.2) {
-        this._navigateTo(target.pos.x, target.pos.z, dt, map);
+        this._chaseStep(dt, map, target.pos);
       }
 
       // Fire rapid single shots while in range.
       this.shootCooldown -= dt;
       if (this.shootCooldown <= 0 && dist < BATTLE_CONE_RANGE) {
         const owner = this.faction === 'friendly' ? 'player' : 'enemy';
-        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, dx / dist, dz / dist, owner);
+        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, dx / dist, dz / dist, owner, this);
         this.shootCooldown = this.shootInterval;
       }
       // Clear any stale wander route so we start fresh once alert ends.
@@ -251,8 +258,65 @@ export class Drone {
       if (this.turnBoostTimer <= 0) this.bulletFacing = null;
     }
 
+    // Soft separation from soldiers, other drones and mechas so a swarm
+    // can't bunch up into a single visual blob.
+    this._avoidOthers(world, dt, map);
+
     this.updateConeMesh(map);
     this._updateHpBar(dt);
+  }
+
+  _chaseStep(dt, map, targetPos) {
+    this.chasePathTimer -= dt;
+    const needsRefresh =
+      this.chasePathTimer <= 0 ||
+      !this.chasePath ||
+      this.chasePos >= this.chasePath.length;
+    if (needsRefresh) {
+      const from = findValidFloor(map, this.mesh.position.x, this.mesh.position.z);
+      const to   = findValidFloor(map, targetPos.x, targetPos.z);
+      const path = (from && to)
+        ? findPath(map, from.x, from.z, to.x, to.z)
+        : null;
+      this.chasePath      = (path && path.length >= 1) ? path : null;
+      this.chasePos       = 0;
+      this.chasePathTimer = 0.4;
+    }
+    if (this.chasePath && this.chasePos < this.chasePath.length) {
+      const wp = this.chasePath[this.chasePos];
+      if (this._navigateTo(wp.x, wp.z, dt, map)) this.chasePos++;
+      return;
+    }
+    // Fallback — fly directly toward the target if no path could be built.
+    this._navigateTo(targetPos.x, targetPos.z, dt, map);
+  }
+
+  _avoidOthers(world, dt, map) {
+    if (!world) return;
+    const groups = [world.enemies, world.drones, world.mechas].filter(Boolean);
+    let pushX = 0, pushZ = 0;
+    for (const arr of groups) {
+      for (const o of arr) {
+        if (o === this || !o || !o.alive) continue;
+        const dx = this.mesh.position.x - o.mesh.position.x;
+        const dz = this.mesh.position.z - o.mesh.position.z;
+        const d  = Math.hypot(dx, dz);
+        const radius = (o.hitRadius ?? 0.4) + 0.6;
+        if (d > radius || d < 0.001) continue;
+        const force = (radius - d) / radius;
+        pushX += (dx / d) * force;
+        pushZ += (dz / d) * force;
+      }
+    }
+    if (pushX !== 0 || pushZ !== 0) {
+      const mag = Math.hypot(pushX, pushZ);
+      this._navigateTo(
+        this.mesh.position.x + pushX / mag,
+        this.mesh.position.z + pushZ / mag,
+        dt * 0.55,
+        map,
+      );
+    }
   }
 
   onBulletNearby(bulletDx, bulletDz) {
