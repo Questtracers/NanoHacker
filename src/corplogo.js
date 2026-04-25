@@ -116,10 +116,11 @@ export function showCorpLogo({ durationMs = 3500, fadeMs = 700 } = {}, onComplet
   let alive = true;
   function loop() {
     if (!alive) return;
-    // Very gentle rotation — a few degrees over the full splash, just enough
-    // to feel alive without ever completing a full turn.
-    t += 0.003;
-    logoGroup.rotation.y = t;
+    // No rotation — just a very subtle "breathing" scale on the whole logo.
+    // Amplitude ≈ 1.5 % so it's barely noticeable, just enough to feel alive.
+    t += 0.022;
+    const s = 1 + Math.sin(t) * 0.015;
+    logoGroup.scale.set(s, s, s);
     renderer.render(scene, camera);
     requestAnimationFrame(loop);
   }

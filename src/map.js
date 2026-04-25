@@ -126,13 +126,16 @@ export function rayMarch(map, ox, oz, dx, dz, maxDist) {
   return maxDist;
 }
 
-// BFS pathfinding on the 4-connected grid. Returns simplified waypoints (corners + endpoints).
-// All moves are axis-aligned — no diagonals, no wall crossing.
-export function findPath(map, sx, sz, ex, ez) {
+// A* pathfinding on the 4-connected grid with a wall-proximity penalty so
+// agents prefer the centre of corridors. Each step has a base cost of 1 plus
+// `wallPenalty` per 4-adjacent wall the destination cell touches — a 3-wide
+// corridor's middle row therefore beats either edge row by 1 unit per cell,
+// while still being beatable when the only path hugs a wall.
+// Returns simplified waypoints (corners + endpoints), axis-aligned only.
+export function findPath(map, sx, sz, ex, ez, wallPenalty = 0.6) {
   sx = Math.round(sx); sz = Math.round(sz);
   ex = Math.round(ex); ez = Math.round(ez);
 
-  // Snap position to nearest walkable cell
   const snap = (ox, oz) => {
     for (let r = 0; r <= 5; r++)
       for (let dz = -r; dz <= r; dz++)
@@ -146,25 +149,59 @@ export function findPath(map, sx, sz, ex, ez) {
   [sx, sz] = s; [ex, ez] = e2;
   if (sx === ex && sz === ez) return [{ x: sx, z: sz }];
 
-  const W = map.width;
+  const W   = map.width;
+  const H   = map.height;
   const enc = (x, z) => z * W + x;
   const endK = enc(ex, ez);
 
+  // Wall-proximity cost for stepping into (x, z): how many 4-neighbours are
+  // walls. Penalises edge-of-corridor cells without forbidding them.
+  const cellCost = (x, z) => {
+    let n = 0;
+    if (isWall(map, x + 1, z)) n++;
+    if (isWall(map, x - 1, z)) n++;
+    if (isWall(map, x, z + 1)) n++;
+    if (isWall(map, x, z - 1)) n++;
+    return 1 + n * wallPenalty;
+  };
+
+  const heuristic = (x, z) => Math.abs(x - ex) + Math.abs(z - ez);
+
+  // Tiny binary-heap-free approach: re-sort the open list when needed. Maps
+  // are small enough that the overhead is negligible.
+  const gScore = new Map([[enc(sx, sz), 0]]);
   const parent = new Map([[enc(sx, sz), -1]]);
-  const queue  = [[sx, sz]];
-  let head = 0, found = false;
+  // open: array of [fScore, x, z, key]
+  const open   = [[heuristic(sx, sz), sx, sz, enc(sx, sz)]];
+  const closed = new Set();
 
   const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
-  outer: while (head < queue.length) {
-    const [cx, cz] = queue[head++];
+  let found = false;
+
+  while (open.length) {
+    // Pull the entry with the lowest fScore (linear — fine for a 68×68 grid)
+    let bestIdx = 0;
+    for (let i = 1; i < open.length; i++) {
+      if (open[i][0] < open[bestIdx][0]) bestIdx = i;
+    }
+    const [, cx, cz, ck] = open.splice(bestIdx, 1)[0];
+    if (closed.has(ck)) continue;
+    if (ck === endK) { found = true; break; }
+    closed.add(ck);
+
+    const cg = gScore.get(ck);
     for (const [dx, dz] of dirs) {
       const nx = cx + dx, nz = cz + dz;
-      if (nx < 0 || nx >= W || nz < 0 || nz >= map.height) continue;
+      if (nx < 0 || nx >= W || nz < 0 || nz >= H) continue;
+      if (isWall(map, nx, nz)) continue;
       const nk = enc(nx, nz);
-      if (parent.has(nk) || isWall(map, nx, nz)) continue;
-      parent.set(nk, enc(cx, cz));
-      if (nk === endK) { found = true; break outer; }
-      queue.push([nx, nz]);
+      if (closed.has(nk)) continue;
+      const tentative = cg + cellCost(nx, nz);
+      const known = gScore.get(nk);
+      if (known !== undefined && tentative >= known) continue;
+      gScore.set(nk, tentative);
+      parent.set(nk, ck);
+      open.push([tentative + heuristic(nx, nz), nx, nz, nk]);
     }
   }
   if (!found) return null;
@@ -177,7 +214,7 @@ export function findPath(map, sx, sz, ex, ez) {
     cur = parent.get(cur);
   }
 
-  // Simplify to corners + endpoints only (keeps routes axis-aligned and compact)
+  // Simplify to corners + endpoints only
   if (cells.length <= 2) return cells;
   const result = [cells[0]];
   for (let i = 1; i < cells.length - 1; i++) {

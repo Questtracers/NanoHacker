@@ -782,75 +782,100 @@ export class HackMinigame {
     const usedIdx = this.availableCommands.indexOf(cmd);
     const prevCursor = { row: this.cursor.row, col: this.cursor.col };
 
+    let applied = false; // true if the command actually mutated cell values
+
     if (cmd.kind === 'patch') {
-      // Apply delta only to the cursor's DIRECT graph neighbours — path or
-      // target nodes reachable in a single hop (adjacency or one filler
-      // corridor). B-through-A-through-C chains are NOT touched.
       const nodes = this._directlyConnectedNodes();
-      let hitSomething = false;
       for (const { r, c } of nodes) {
         const cell = this.board[r][c];
-        if (cell.value === 0) continue; // preserve 0-combos
+        if (cell.value === 0) continue;
         cell.value = wrap10(cell.value + cmd.delta);
-        hitSomething = true;
+        applied = true;
       }
-      if (!hitSomething) {
+      if (!applied) {
         this._appendLines([`<span class="hk-err">fault :: no live nodes in segment</span>`]);
-      } else {
-        this._cascadeCursor();
       }
     } else if (cmd.kind === 'routine') {
       if (cmd.type === 'del')    this._routineDelete(cmd.n);
       if (cmd.type === 'shift')  this._routineShift(cmd.delta);
       if (cmd.type === 'reseed') this._routineReseed();
-      this._cascadeCursor();
+      applied = true;
     }
 
-    // Win check: cursor is on a target cell, OR any target chunk is a direct
-    // graph-neighbour of the cursor (cursor reached a node wired to memory).
-    const t = this.targetCell;
-    const inBand = (r, c) =>
-      r === t.row && c >= t.col && c < t.col + this.targetWidth;
-    const won =
-      inBand(this.cursor.row, this.cursor.col) ||
-      this._directlyConnectedNodes().some(n => inBand(n.r, n.c));
-    if (won) {
-      this.gameOver = true; this.won = true;
-      this.awaitingDismiss = true;
-      if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null; }
-      if (this.inputRowEl)   this.inputRowEl.classList.remove('danger');
-      if (this.clockFaceEl)  this.clockFaceEl.style.color = '#44ff88';
-      if (this.clockTimeEl)  this.clockTimeEl.style.color = '#44ff88';
-      if (this.clockLabelEl) this.clockLabelEl.style.color = '#2a7a3a';
-      // Compute the cursor→target connection so every cell on it can render
-      // in the success cyan alongside the banner.
-      this.winRoute = this._findWinRoute();
-      const sepLen = PREFIX_W + COLS * CELL_W;
-      const sep    = '\u2500'.repeat(sepLen);
-      this._appendLines([
-        `<span class="hk-dim">:: trace ${String(this.run).padStart(2, '0')}.${String(this.depth).padStart(3, '0')} :: final state ::</span>`,
-        ...this._makeBoardLines(),
-        `<span class="hk-sep">${this._esc(sep)}</span>`,
-        `<span class="hk-ok">-- ACCESS GRANTED // ${this.targetAddr} compromised // returning --</span>`,
-        `<span class="hk-dim">close terminal? (y/n)</span>`,
-      ]);
-      return;
-    }
+    // EARLY win check — did this command alone open a clean corridor (conns,
+    // already-locked trail, and now-zeroed cells) all the way to the goal?
+    // If yes, declare victory at the cursor's CURRENT position so the player
+    // visually stays where they were when they hacked the final node.
+    if (applied && this._goalCorridorOpen()) return this._handleWin();
 
-    // On a jump (cursor actually moved), every 0-cell in the whole maze —
-    // including locked / disconnected combos — gets rerandomised. When the
-    // cursor stayed put nothing resets.
+    // Otherwise let the cursor cascade through any chain of live 0-cells the
+    // command produced, then check connectivity again as a safety net.
+    if (applied) this._cascadeCursor();
+    if (this._goalCorridorOpen()) return this._handleWin();
+
     const cursorMoved = this.cursor.row !== prevCursor.row ||
                         this.cursor.col !== prevCursor.col;
     if (cursorMoved) this._reassignZeroPaths();
 
-    // Replace only the slot that was just used — the other functions persist.
     if (usedIdx >= 0) {
       this.availableCommands[usedIdx] = this._generateReplacement(usedIdx);
     }
 
     this._updateStatus();
     this._appendDump();
+  }
+
+  // Goal-reachable BFS used for the "did this op win the run?" check. Walks
+  // through any cell a successful run would naturally cross: conns, locked
+  // trail, freshly-zeroed path nodes, and target cells. Live (non-zero) path
+  // nodes block, since those are the gates the player still has to crack.
+  _goalCorridorOpen() {
+    const t = this.targetCell;
+    if (!t) return false;
+    const inBand = (r, c) =>
+      r === t.row && c >= t.col && c < t.col + this.targetWidth;
+    const seen = new Set([`${this.cursor.row},${this.cursor.col}`]);
+    const q = [{ r: this.cursor.row, c: this.cursor.col }];
+    while (q.length) {
+      const { r, c } = q.shift();
+      if (inBand(r, c)) return true;
+      for (const d of DIRS) {
+        const nr = r + d.dr, nc = c + d.dc;
+        if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
+        const k = `${nr},${nc}`;
+        if (seen.has(k)) continue;
+        const cell = this.board[nr][nc];
+        if (cell.type === 'wall') continue;
+        const passable =
+          cell.type === 'conn' ||
+          cell.type === 'target' ||
+          (cell.type === 'path' && (cell.locked || cell.value === 0));
+        if (!passable) continue;
+        seen.add(k);
+        q.push({ r: nr, c: nc });
+      }
+    }
+    return false;
+  }
+
+  _handleWin() {
+    this.gameOver = true; this.won = true;
+    this.awaitingDismiss = true;
+    if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null; }
+    if (this.inputRowEl)   this.inputRowEl.classList.remove('danger');
+    if (this.clockFaceEl)  this.clockFaceEl.style.color = '#44ff88';
+    if (this.clockTimeEl)  this.clockTimeEl.style.color = '#44ff88';
+    if (this.clockLabelEl) this.clockLabelEl.style.color = '#2a7a3a';
+    this.winRoute = this._findWinRoute();
+    const sepLen = PREFIX_W + COLS * CELL_W;
+    const sep    = '\u2500'.repeat(sepLen);
+    this._appendLines([
+      `<span class="hk-dim">:: trace ${String(this.run).padStart(2, '0')}.${String(this.depth).padStart(3, '0')} :: final state ::</span>`,
+      ...this._makeBoardLines(),
+      `<span class="hk-sep">${this._esc(sep)}</span>`,
+      `<span class="hk-ok">-- ACCESS GRANTED // ${this.targetAddr} compromised // returning --</span>`,
+      `<span class="hk-dim">close terminal? (y/n)</span>`,
+    ]);
   }
 
   // Pick a non-zero value in [-9, 9] enforcing the sibling rule: for every
@@ -984,21 +1009,27 @@ export class HackMinigame {
 
 
 
-  // Shortest cell-by-cell path from the cursor to any target-band cell,
-  // walking only through non-wall cells. Used to highlight the hacked
-  // connection in success cyan when the run ends.
+  // Single shortest-path BFS from the cursor's WIN position to the goal,
+  // walking only through cells that genuinely belong to the hack route:
+  // conns, locked trail, freshly-zeroed path nodes, and target cells. Spurs
+  // the player visited but that aren't on the way to the goal are pruned by
+  // construction — they're not on any shortest path. Reconstructs the path
+  // by parent pointers so only the cells actually traversed get coloured.
   _findWinRoute() {
-    const set    = new Set();
+    const set = new Set();
+    const key = (r, c) => `${r},${c}`;
     const target = this.targetCell;
+    if (!target) {
+      set.add(key(this.cursor.row, this.cursor.col));
+      return set;
+    }
     const inBand = (r, c) =>
       r === target.row && c >= target.col && c < target.col + this.targetWidth;
-    const key = (r, c) => `${r},${c}`;
-
     const startKey = key(this.cursor.row, this.cursor.col);
     const visited  = new Set([startKey]);
     const parent   = new Map();
     const q        = [{ r: this.cursor.row, c: this.cursor.col }];
-
+    let reached    = false;
     while (q.length) {
       const cur = q.shift();
       if (inBand(cur.r, cur.c)) {
@@ -1007,22 +1038,30 @@ export class HackMinigame {
           set.add(k);
           k = parent.get(k);
         }
-        return set;
+        reached = true;
+        break;
       }
       for (const d of DIRS) {
         const nr = cur.r + d.dr, nc = cur.c + d.dc;
         if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
         const k = key(nr, nc);
         if (visited.has(k)) continue;
-        if (this.board[nr][nc].type === 'wall') continue;
+        const cell = this.board[nr][nc];
+        if (cell.type === 'wall') continue;
+        const onRoute =
+          cell.type === 'conn' ||
+          cell.type === 'target' ||
+          (cell.type === 'path' && (cell.locked || cell.value === 0));
+        if (!onRoute) continue;
         visited.add(k);
         parent.set(k, key(cur.r, cur.c));
         q.push({ r: nr, c: nc });
       }
     }
-    // Cursor might already be on the target band — include all band cells.
-    for (let k = 0; k < this.targetWidth; k++) set.add(key(target.row, target.col + k));
-    set.add(startKey);
+    if (!reached) {
+      for (let k = 0; k < this.targetWidth; k++) set.add(key(target.row, target.col + k));
+      set.add(startKey);
+    }
     return set;
   }
 
@@ -1081,8 +1120,9 @@ export class HackMinigame {
       const chunk = cell.chunk ?? 0;
       const start = chunk * CELL_W;
       const text  = this.targetAddr.slice(start, start + CELL_W).padEnd(CELL_W);
-      const cls   = onWinRoute ? 'hk-winroute' : 'hk-target';
-      return `<span class="${cls}">${this._esc(text)}</span>`;
+      // Goal address always renders in its own yellow — even when the rest
+      // of the trail is blue post-win, "0x05c" stays the marker colour.
+      return `<span class="hk-target">${this._esc(text)}</span>`;
     }
 
     if (cell.type === 'path') {

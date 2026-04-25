@@ -28,7 +28,9 @@ export class Player {
   get position() { return this.mesh.position; }
 
   // Isometric WASD: input mapped so "up" is into-screen along iso axis.
-  update(dt, map) {
+  // `doorBlocks(x, z)` is an optional callback that returns true if a closed
+  // door currently obstructs the player at that world position.
+  update(dt, map, doorBlocks = null) {
     let ix = 0, iz = 0;
     if (this.keys.has('w')) iz -= 1;
     if (this.keys.has('s')) iz += 1;
@@ -39,20 +41,21 @@ export class Player {
     if (!this.movedThisFrame) { this.lastMoveAmount = 0; return; }
     ix /= len; iz /= len;
 
-    // Level-aligned movement matched to the camera orientation.
-    // Camera is mostly along +X, so: W/S = world -X/+X, A/D = world +Z/-Z.
-    const wx =  iz;   // W(iz=-1)→-X, S(iz=+1)→+X
-    const wz = -ix;   // A(ix=-1)→+Z, D(ix=+1)→-Z
+    const wx =  iz;
+    const wz = -ix;
 
     const step = this.speed * dt;
     this.lastMoveAmount = step;
     const p = this.mesh.position;
     const nx = p.x + wx * step;
     const nz = p.z + wz * step;
-    // Axis-separated wall collision
-    if (!isWall(map, nx, p.z) && !isWall(map, nx + Math.sign(wx) * 0.3, p.z) &&
+    const blockX = doorBlocks ? doorBlocks(nx, p.z) : false;
+    const blockZ = doorBlocks ? doorBlocks(p.x, nz) : false;
+    if (!blockX &&
+        !isWall(map, nx, p.z) && !isWall(map, nx + Math.sign(wx) * 0.3, p.z) &&
         !isWall(map, nx, p.z + 0.3) && !isWall(map, nx, p.z - 0.3)) p.x = nx;
-    if (!isWall(map, p.x, nz) && !isWall(map, p.x + 0.3, nz) &&
+    if (!blockZ &&
+        !isWall(map, p.x, nz) && !isWall(map, p.x + 0.3, nz) &&
         !isWall(map, p.x - 0.3, nz) && !isWall(map, p.x, nz + Math.sign(wz) * 0.3)) p.z = nz;
 
     // face movement direction and memorize it for the gun shot

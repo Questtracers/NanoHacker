@@ -203,10 +203,23 @@ export class Enemy {
   }
 
   _tryMove(dx, dz, dt, map) {
-    const step = this.speed * dt;
-    const p    = this.mesh.position;
-    if (!isWall(map, p.x + dx * step, p.z)) p.x += dx * step;
-    if (!isWall(map, p.x, p.z + dz * step)) p.z += dz * step;
+    // Same axis-separated wall check the player uses, with a 0.3-unit body
+    // margin so soldiers don't clip into obstacle edges or hug walls in tight
+    // corridors. Helps keep their patrol look centred and prevents
+    // "spawned-on-an-obstacle" visual stuck states.
+    const step   = this.speed * dt;
+    const p      = this.mesh.position;
+    const margin = 0.3;
+    const nx = p.x + dx * step;
+    const nz = p.z + dz * step;
+    if (!isWall(map, nx, p.z) &&
+        !isWall(map, nx + Math.sign(dx) * margin, p.z) &&
+        !isWall(map, nx, p.z + margin) &&
+        !isWall(map, nx, p.z - margin)) p.x = nx;
+    if (!isWall(map, p.x, nz) &&
+        !isWall(map, p.x + margin, nz) &&
+        !isWall(map, p.x - margin, nz) &&
+        !isWall(map, p.x, nz + Math.sign(dz) * margin)) p.z = nz;
   }
 
   _advanceRoute() {

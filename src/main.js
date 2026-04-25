@@ -3,6 +3,7 @@ import { generateMap, buildMapMesh, pickFloorCell, findPath, findValidFloor, pic
 import { Player } from './player.js';
 import { Enemy } from './enemy.js';
 import { Drone } from './drone.js';
+import { Door } from './door.js';
 import { Bullet } from './bullet.js';
 import { DebugSystem } from './debug.js';
 import { HackMinigame } from './hack.js';
@@ -150,10 +151,50 @@ function buildEnemyRoute(enemy) {
   if (path && path.length >= 2) enemy.setRoutePath(path);
 }
 
+// Find a clean spawn spot near (cx, cz). Three passes:
+//   1. all 8 neighbours walkable (true open floor)
+//   2. all 4 NSEW neighbours walkable (free of obstacles on cardinal sides)
+//   3. fallback to the standard findValidFloor (may end up next to something)
+// This keeps soldiers off obstacle edges in tight rooms where a strict 8-
+// neighbour search wouldn't find anything.
+function findCenteredFloor(cx, cz, radius = 8) {
+  const isFree = (x, z) =>
+    x > 0 && z > 0 && x < map.width - 1 && z < map.height - 1 &&
+    map.grid[z][x] === 0;
+  // Pass 1 — fully centered cell
+  for (let r = 0; r <= radius; r++) {
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const x = Math.round(cx + dx), z = Math.round(cz + dz);
+        if (!isFree(x, z)) continue;
+        let ok = true;
+        for (let oz = -1; oz <= 1 && ok; oz++) {
+          for (let ox = -1; ox <= 1 && ok; ox++) {
+            if (ox === 0 && oz === 0) continue;
+            if (!isFree(x + ox, z + oz)) ok = false;
+          }
+        }
+        if (ok) return { x, z };
+      }
+    }
+  }
+  // Pass 2 — only the 4 NSEW neighbours need to be walkable
+  for (let r = 0; r <= radius; r++) {
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const x = Math.round(cx + dx), z = Math.round(cz + dz);
+        if (!isFree(x, z)) continue;
+        if (isFree(x + 1, z) && isFree(x - 1, z) &&
+            isFree(x, z + 1) && isFree(x, z - 1)) return { x, z };
+      }
+    }
+  }
+  return findValidFloor(map, cx, cz);
+}
+
 for (let i = 0; i < enemyCount; i++) {
   const room = map.rooms[1 + (i % (map.rooms.length - 1))] || map.rooms[0];
-  // Snap spawn to a valid (non-wall, non-obstacle) cell near room centre
-  const spawnPos = findValidFloor(map, room.cx, room.cy);
+  const spawnPos = findCenteredFloor(room.cx, room.cy);
   if (!spawnPos) continue;
   if (Math.hypot(spawnPos.x - spawnCell.x, spawnPos.z - spawnCell.z) < 6) continue;
   const e = new Enemy(scene, spawnPos.x, spawnPos.z);
@@ -164,6 +205,72 @@ for (let i = 0; i < enemyCount; i++) {
 // Debug system — TAB
 const debug = new DebugSystem(scene);
 debug.buildRoutes(enemies);
+
+// ── Doors ────────────────────────────────────────────────────────────────────
+// Doors live ONLY in the 3-cell-wide corridors that the map generator carves
+// between consecutive rooms. Each such corridor independently has a 50 % chance
+// of receiving exactly one door, placed on a corridor cell that lies outside
+// every room rectangle (so they're never confused with in-room obstacles).
+const doors = [];
+function spawnCorridorDoors() {
+  const isInsideAnyRoom = (x, y) => {
+    for (const r of map.rooms) {
+      if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return true;
+    }
+    return false;
+  };
+
+  for (let i = 1; i < map.rooms.length; i++) {
+    if (Math.random() >= 0.5) continue; // 50 % per corridor
+
+    // Reconstruct the same L-shape the generator carved: horizontal leg first
+    // along the source room's centre row, then vertical leg up the dest col.
+    const a = map.rooms[i - 1];
+    const b = map.rooms[i];
+    let cx = a.cx, cy = a.cy;
+    const tx = b.cx, ty = b.cy;
+    const path = [];
+    while (cx !== tx) {
+      path.push({ x: cx, y: cy, dir: 'EW' });
+      cx += cx < tx ? 1 : -1;
+    }
+    while (cy !== ty) {
+      path.push({ x: cx, y: cy, dir: 'NS' });
+      cy += cy < ty ? 1 : -1;
+    }
+
+    // Keep only true corridor cells (outside all rooms), away from spawn,
+    // not piling up on top of another door, AND on a straight stretch (skip
+    // any cell where the corridor changes direction so a door never sits on
+    // an L-bend, which would render with the slab not actually covering the
+    // passable cells).
+    const valid = path.filter((p, i) => {
+      if (isInsideAnyRoom(p.x, p.y)) return false;
+      if (Math.hypot(p.x - spawnCell.x, p.y - spawnCell.z) <= 4) return false;
+      if (doors.some(d => Math.hypot(d.x - p.x, d.z - p.y) < 3)) return false;
+      const prev = path[i - 1];
+      const next = path[i + 1];
+      if (prev && prev.dir !== p.dir) return false;
+      if (next && next.dir !== p.dir) return false;
+      return true;
+    });
+    if (!valid.length) continue;
+
+    // Pick somewhere in the middle third for a more chokepoint-y feel.
+    const lo = Math.floor(valid.length * 0.25);
+    const hi = Math.max(lo + 1, Math.floor(valid.length * 0.75));
+    const idx = lo + Math.floor(Math.random() * (hi - lo));
+    const pt  = valid[idx];
+    doors.push(new Door(scene, pt.x, pt.y, pt.dir));
+  }
+}
+spawnCorridorDoors();
+
+// Returns true if a closed (and un-hacked) door overlaps the player at (x, z).
+function doorBlocksPlayer(x, z) {
+  for (const d of doors) if (d.blocksPlayerAt(x, z)) return true;
+  return false;
+}
 
 // Hacking minigame — R. Premium in-terminal commands (cls, overclock, numeric
 // shortcuts) spend hack points from the world pool.
@@ -204,7 +311,8 @@ const pickRing = (() => {
 function findHackLinkTarget() {
   let best = null, bestDist = Infinity;
   const p = player.position;
-  for (const e of enemies.concat(drones)) {
+  // Soldiers + drones + un-hacked doors are all valid hack targets.
+  for (const e of enemies.concat(drones).concat(doors)) {
     if (!e.alive || e.faction === 'friendly') continue;
     const d = Math.hypot(e.mesh.position.x - p.x, e.mesh.position.z - p.z);
     if (d > HACK_RANGE) continue;
@@ -241,8 +349,9 @@ window.addEventListener('keydown', e => {
     pickRing.visible = true;
 
     let diff;
-    if (debug.enabled)               diff = 2;
-    else if (isSpot)                 diff = 7;
+    if (debug.enabled)                diff = 2;
+    else if (isSpot)                  diff = 7;
+    else if (target instanceof Door)  diff = 2;
     else if (target instanceof Drone) diff = 3;
     else                              diff = 5;
 
@@ -262,10 +371,9 @@ window.addEventListener('keydown', e => {
       }
       // Failed hack: 1 HP damage to the player.
       playerTakeDamage(1);
-      if (!isSpot && target && target.alive) {
-        // Enemy becomes aware of the player — same outcome as being spotted.
-        // Snap their cone toward the player so they re-acquire line of sight
-        // immediately. Soldiers also trigger a drone reinforcement wave.
+      // Doors don't react — they just stay closed. Spot A is an objective,
+      // not an entity. Only enemies become aware on a failed hack.
+      if (!isSpot && target && target.alive && !(target instanceof Door)) {
         target.alerted          = true;
         target.losingSightTimer = 0;
         const ep = target.mesh.position;
@@ -442,7 +550,7 @@ function animate() {
   if (tickPendingHack()) { renderer.render(scene, camera); return; }
   if (hacker.active)     { renderer.render(scene, camera); return; }
 
-  player.update(dt, map);
+  player.update(dt, map, doorBlocksPlayer);
 
   // Battle mode = some HOSTILE enemy is actively tracking the player. Friendly
   // enemies fighting other hostiles don't count — the player is allied with them.
@@ -462,6 +570,9 @@ function animate() {
   const worldView = { player, enemies, drones };
   for (const e of enemies) e.update(worldDt, map, worldView, game);
   for (const d of drones)  d.update(worldDt, map, worldView, game, time);
+  // Doors animate at real-time speed (not SUPERHOT-modulated) so the open
+  // animation always feels responsive when an enemy approaches.
+  for (const dr of doors) dr.update(dt, worldView);
 
   // Player bullets can damage both soldiers and drones.
   const bulletTargets = enemies.concat(drones);
