@@ -17,6 +17,9 @@ export class Bullet {
     this.life  = 3;
     this.alive = true;
     this.owner = owner;
+    // Damage applied to player on a 'hit' return — most bullets are 1, but
+    // exposing it lets explosive rounds (rockets) report a heavier hit.
+    this.damage = 1;
     // Whoever fired this bullet — excluded from collision so they can't
     // self-damage at spawn. Friendly fire is otherwise on for everyone else.
     this.shooter = shooter;

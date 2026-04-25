@@ -100,9 +100,9 @@ export class DebugSystem {
       const ep    = e.position;
       const fDeg  = ((e.facing * 180 / Math.PI) % 360 + 360) % 360;
       let row = `E${i}  ${icon}  (${ep.x.toFixed(1)},${ep.z.toFixed(1)})  ${fDeg.toFixed(0)}°`;
-      if (e.alerted)      row += `  ls:${e.losingSight.toFixed(0)}`;
-      if (e.waitTimer > 0) row += `  wait:${e.waitTimer.toFixed(1)}s`;
-      if (e.routePath) row += `  wp:${e.pathPos}/${e.routePath.length - 1}`;
+      if (e.alerted)        row += `  ls:${(e.losingSightTimer ?? 0).toFixed(1)}`;
+      if (e.waitTimer > 0)  row += `  wait:${e.waitTimer.toFixed(1)}s`;
+      if (e.routePath)      row += `  wp:${e.pathPos}/${e.routePath.length - 1}`;
       lines.push(row);
     });
 
@@ -120,7 +120,7 @@ export class DebugSystem {
         const ep    = e.position;
         const fDeg  = ((e.facing * 180 / Math.PI) % 360 + 360) % 360;
         let row = `<span style="color:${col}">E${i}</span>  ${icon}  (${ep.x.toFixed(1)},${ep.z.toFixed(1)})  ${fDeg.toFixed(0)}°`;
-        if (e.alerted)       row += `  <span style="opacity:.7">ls:${e.losingSight.toFixed(0)}</span>`;
+        if (e.alerted)       row += `  <span style="opacity:.7">ls:${(e.losingSightTimer ?? 0).toFixed(1)}</span>`;
         if (e.waitTimer > 0) row += `  <span style="opacity:.7">wait:${e.waitTimer.toFixed(1)}s</span>`;
         if (e.routePath)         row += `  wp<b>${e.pathPos}</b>/${e.routePath.length - 1}`;
         return row;

@@ -7,6 +7,7 @@ import { Door } from './door.js';
 import { Obstacle } from './obstacle.js';
 import { Mecha } from './mecha.js';
 import { Bullet } from './bullet.js';
+import { Rocket } from './rocket.js';
 import { DebugSystem } from './debug.js';
 import { HackMinigame } from './hack.js';
 import { showCorpLogo } from './corplogo.js';
@@ -508,6 +509,13 @@ window.addEventListener('keydown', e => {
   if (gameOver || hacker.active || pendingHack) return;
   const k = e.key.toLowerCase();
   if (k === 'r') {
+    // Possession shortcuts (no minigame):
+    //   • Currently driving a mecha → R ejects.
+    //   • Standing next to a friendly (already-hacked) mecha → R re-enters it.
+    if (possessedMecha) { ejectFromMecha(); return; }
+    const allyMecha = findAllyMechaInRange();
+    if (allyMecha)      { enterMechaPossession(allyMecha); return; }
+
     const p = player.position;
     const spotDist = Math.hypot(p.x - spotACell.x, p.z - spotACell.y);
     const spotInRange = !foundSpotA && spotDist < HACK_RANGE;
@@ -550,6 +558,9 @@ window.addEventListener('keydown', e => {
           hudObj.innerHTML    = 'Objective: reach the <b style="color:#7f5">Exit</b>';
         } else if (target.alive && typeof target.hackLink === 'function') {
           target.hackLink();
+          // Hack-linking a mecha drops the player straight into possession —
+          // no second "open the door" step. Eject (R) leaves it as an ally.
+          if (target instanceof Mecha) enterMechaPossession(target);
         }
         return;
       }
@@ -611,13 +622,70 @@ const bullets   = [];
 let battleMode  = false;
 let foundSpotA  = false;
 let gameOver    = false;
+// Possession — when set, the player is driving this mecha. Their human body
+// is hidden, input routes to the mecha, and camera follows it. Mecha death
+// while possessed kills the player too.
+let possessedMecha = null;
+
+function enterMechaPossession(m) {
+  if (possessedMecha || !m || !m.alive) return;
+  possessedMecha = m;
+  m.enterPossession();
+  // Stash the body inside the mecha so any AI looking up world.player.position
+  // sees the mecha (rather than the abandoned human in the corridor).
+  player.mesh.position.x = m.mesh.position.x;
+  player.mesh.position.z = m.mesh.position.z;
+  player.mesh.visible    = false;
+  player.facingTri.visible = false;
+  player.aimLine.visible   = false;
+  updatePlayerHPHUD();
+  updateShotHUD();
+}
+
+function ejectFromMecha() {
+  if (!possessedMecha) return;
+  const m = possessedMecha;
+  // Drop the human a body-length BEHIND the mecha (opposite the facing).
+  const bx = m.mesh.position.x - Math.sin(m.facing) * 1.6;
+  const bz = m.mesh.position.z - Math.cos(m.facing) * 1.6;
+  player.mesh.position.x = bx;
+  player.mesh.position.z = bz;
+  player.facing = m.facing;
+  player.facingDir.x = Math.sin(m.facing);
+  player.facingDir.z = Math.cos(m.facing);
+  player.mesh.visible = true;
+  player.facingTri.visible = true;
+  m.leavePossession();
+  possessedMecha = null;
+  updatePlayerHPHUD();
+  updateShotHUD();
+}
+
+function findAllyMechaInRange() {
+  const p = player.position;
+  let best = null, bestD = Infinity;
+  for (const m of mechas) {
+    if (!m.alive || m.faction !== 'friendly') continue;
+    const d = Math.hypot(m.mesh.position.x - p.x, m.mesh.position.z - p.z);
+    if (d <= HACK_RANGE && d < bestD) { bestD = d; best = m; }
+  }
+  return best;
+}
 
 // ── Player life ─────────────────────────────────────────────────────────────
 const PLAYER_MAX_HP = 2;
 let   playerHp      = PLAYER_MAX_HP;
 const hudPlayerHP   = document.getElementById('php');
 function updatePlayerHPHUD() {
-  if (hudPlayerHP) hudPlayerHP.innerHTML = `HP: <b>${playerHp} / ${PLAYER_MAX_HP}</b>`;
+  if (!hudPlayerHP) return;
+  // While possessing a mecha, the bar reports the mecha's HP — that's the
+  // body actually taking hits. The human's HP is parked until eject.
+  if (possessedMecha && possessedMecha.alive) {
+    hudPlayerHP.innerHTML =
+      `Mecha HP: <b>${possessedMecha.hp} / ${possessedMecha.maxHp}</b>`;
+    return;
+  }
+  hudPlayerHP.innerHTML = `HP: <b>${playerHp} / ${PLAYER_MAX_HP}</b>`;
 }
 function playerTakeDamage(n = 1) {
   if (gameOver) return;
@@ -638,16 +706,41 @@ const SHOT_COOLDOWN = 5.0;
 let   shotCooldown  = 0;
 
 const hudShot = document.getElementById('shot');
+function _fmtCd(c) {
+  return c <= 0
+    ? '<b style="color:#7ff">READY</b>'
+    : `<b>${c.toFixed(1)}s</b>`;
+}
 function updateShotHUD() {
   if (!hudShot) return;
-  hudShot.innerHTML = shotCooldown <= 0
-    ? 'Shot: <b style="color:#7ff">READY</b>'
-    : `Shot: <b>${shotCooldown.toFixed(1)}s</b>`;
+  // Possessed mecha → show BOTH weapons' reloads side by side. The mecha
+  // owns these timers; we just read them every frame.
+  if (possessedMecha && possessedMecha.alive) {
+    const sd = Math.max(0, possessedMecha.shootCooldown);
+    const rd = Math.max(0, possessedMecha.rocketCooldown);
+    hudShot.innerHTML =
+      `Shot: ${_fmtCd(sd)} <span style="opacity:.5">|</span> ` +
+      `<span style="color:#ff8866">Rocket: ${_fmtCd(rd)}</span>`;
+    return;
+  }
+  hudShot.innerHTML = `Shot: ${_fmtCd(shotCooldown)}`;
 }
 
 window.addEventListener('keydown', e => {
+  // F → mecha rocket launcher (only valid while possessing a mecha).
+  if (e.key.toLowerCase() === 'f') {
+    if (gameOver || hacker.active) return;
+    if (possessedMecha) possessedMecha.playerFireRocket(game);
+    return;
+  }
   if (e.key !== ' ') return;
   if (gameOver || hacker.active) return;
+  // While driving a mecha SPACE fires its 3-bullet fan instead of the
+  // player's pistol shot. Cooldown is managed inside the mecha.
+  if (possessedMecha) {
+    possessedMecha.playerFire(game);
+    return;
+  }
   if (shotCooldown > 0) return;
   const d = player.facingDir;
   const len = Math.hypot(d.x, d.z) || 1;
@@ -707,6 +800,11 @@ const game = {
   spawnBullet(x, z, dx, dz, owner = 'enemy', shooter = null) {
     bullets.push(new Bullet(scene, x, z, dx, dz, owner, shooter));
   },
+  // Mecha-only — explosive round on a long cooldown. Lives in the same
+  // bullets array since its update / alive / damage interface matches.
+  spawnRocket(x, z, dx, dz, owner = 'player', shooter = null) {
+    bullets.push(new Rocket(scene, x, z, dx, dz, owner, shooter));
+  },
   // Helpers for obstacle / door interaction.
   obstacleAt,
   damageObstacleAt,
@@ -737,7 +835,21 @@ function animate() {
   if (tickPendingHack()) { renderer.render(scene, camera); return; }
   if (hacker.active)     { renderer.render(scene, camera); return; }
 
-  player.update(dt, map, doorBlocksPlayer, battleMode);
+  // Skip player.update while possessing a mecha — the human is hidden and
+  // their input gets routed to the mecha inside that entity's own update.
+  // Keep the human's position glued to the mecha so any AI looking up
+  // world.player.position sees the mecha (no stale waypoint in the corridor
+  // where the player got in).
+  if (!possessedMecha) {
+    player.update(dt, map, doorBlocksPlayer, battleMode);
+  } else {
+    player.mesh.position.x = possessedMecha.mesh.position.x;
+    player.mesh.position.z = possessedMecha.mesh.position.z;
+    // HUD readouts pull live values from the mecha — refresh every frame so
+    // mecha HP / cooldown updates are visible.
+    updatePlayerHPHUD();
+    updateShotHUD();
+  }
 
   // Battle mode = some HOSTILE enemy is actively tracking the player. Friendly
   // enemies fighting other hostiles don't count — the player is allied with them.
@@ -747,19 +859,20 @@ function animate() {
     mechas.some(m => m.alive && m.alerted && m.faction === 'hostile');
   if (anyAlerted !== battleMode) { battleMode = anyAlerted; updateModeUI(); }
 
-  // Battle time control — two speeds:
-  //   • Player MOVING (WASD) → full speed (dt).
-  //   • Anything else        → slow-mo at 8 %, including standing perfectly
-  //                            still. Movement is the only thing that
-  //                            unfreezes the world during a fight.
-  // Stealth mode always runs in real time.
+  // Slow-mo trigger uses whichever body the player is currently driving.
+  // While possessing the mecha, WASD on the mecha counts as "moving"; the
+  // human's stationary mesh shouldn't gate the world clock.
+  const ctrlMoved = possessedMecha
+    ? ['w','a','s','d'].some(k => player.keys.has(k))
+    : player.movedThisFrame;
+
   let worldDt = dt;
-  if (battleMode && !player.movedThisFrame) {
+  if (battleMode && !ctrlMoved) {
     worldDt = dt * 0.08;
   }
 
-  // Aim line is only meaningful in combat — show it while battle is on.
-  player.aimLine.visible = battleMode;
+  // Aim line is only meaningful for the human form in combat.
+  player.aimLine.visible = battleMode && !possessedMecha;
 
   // Entities pull `realDt` off the world view to rotate / cool down in real
   // time even while the world is in slow-mo. Movement still uses worldDt so
@@ -768,20 +881,35 @@ function animate() {
     player, enemies, drones, mechas, map, destroyObstacleAt,
     realDt: dt, battleMode,
     debugOpen: debug.enabled, // forces every door to its open state
+    cameraYaw: CAM_YAW,       // entities billboard their HP bars on this
   };
   for (const e of enemies) e.update(worldDt, map, worldView, game);
   for (const d of drones)  d.update(worldDt, map, worldView, game, time);
   for (const m of mechas)  m.update(worldDt, map, worldView, game);
   for (const dr of doors)  dr.update(dt, worldView);
 
+  // Possessed mecha just blew up — the player goes with it.
+  if (possessedMecha && !possessedMecha.alive) {
+    const wreck = possessedMecha;
+    possessedMecha = null;
+    // Restore the human visuals so the eliminated overlay isn't behind the
+    // hidden body (and so a future "New Run" reset doesn't carry over the
+    // hidden state). Position doesn't matter — the run is over.
+    player.mesh.visible = true;
+    player.facingTri.visible = true;
+    return endGame('Destroyed inside the mecha');
+  }
+
   // Player bullets can damage both soldiers and drones (and mechas, added
-  // below). Game callbacks let bullets damage obstacles on impact.
+  // below). Game callbacks let bullets damage obstacles on impact. While the
+  // human is hidden inside a mecha we pass `null` so stray bullets don't
+  // chip the invisible body — only the mecha takes hits.
   const bulletTargets = enemies.concat(drones).concat(mechas);
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
-    const r = b.update(worldDt, map, player, bulletTargets, game);
+    const r = b.update(worldDt, map, possessedMecha ? null : player, bulletTargets, game);
     if (r === 'hit') {
-      playerTakeDamage(1);
+      playerTakeDamage(b.damage ?? 1);
       if (gameOver) return;
     }
     if (!b.alive) bullets.splice(i, 1);
@@ -794,14 +922,18 @@ function animate() {
     updateShotHUD();
   }
 
-  // Camera follow
-  const pos = player.position;
+  // Camera follow — anchors on whichever body the player is driving.
+  const followPos = possessedMecha ? possessedMecha.mesh.position : player.position;
+  // `pos` is used by hack-collection + exit-reach checks below; alias it to
+  // the camera focus so a possessed mecha can collect hacks / cross the exit
+  // just like the human form.
+  const pos = followPos;
   camera.position.set(
-    pos.x + Math.sin(CAM_YAW) * CAM_RADIUS,
+    followPos.x + Math.sin(CAM_YAW) * CAM_RADIUS,
     CAM_HEIGHT,
-    pos.z + Math.cos(CAM_YAW) * CAM_RADIUS
+    followPos.z + Math.cos(CAM_YAW) * CAM_RADIUS
   );
-  camera.lookAt(pos.x, 0.5, pos.z);
+  camera.lookAt(followPos.x, 0.5, followPos.z);
 
   // Off-screen pointers — Spot A while it's still the goal, then the exit.
   camera.updateMatrixWorld();

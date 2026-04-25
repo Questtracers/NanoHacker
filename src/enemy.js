@@ -166,12 +166,23 @@ export class Enemy {
       for (const d of world.drones || []) {
         if (d.alive && d.faction === 'friendly') pool.push({ pos: d.mesh.position, ent: d });
       }
+      // Friendly mechas are valid targets too. A POSSESSED mecha counts as
+      // "the player" for trigger purposes (drone backup, alerted UI), since
+      // the human is literally driving it.
+      for (const m of world.mechas || []) {
+        if (m.alive && m.faction === 'friendly') {
+          pool.push({ pos: m.mesh.position, ent: m, isPlayer: m.possessed === true });
+        }
+      }
     } else {
       for (const e of world.enemies || []) {
         if (e !== this && e.alive && e.faction === 'hostile') pool.push({ pos: e.mesh.position, ent: e });
       }
       for (const d of world.drones || []) {
         if (d.alive && d.faction === 'hostile') pool.push({ pos: d.mesh.position, ent: d });
+      }
+      for (const m of world.mechas || []) {
+        if (m.alive && m.faction === 'hostile') pool.push({ pos: m.mesh.position, ent: m });
       }
     }
     let best = null, bestDist = Infinity;
@@ -434,7 +445,7 @@ export class Enemy {
       : dt;
     this._smoothTurn(turnDt);
     this.updateConeMesh(map);
-    this._updateHpBar(dt);
+    this._updateHpBar(dt, world?.cameraYaw);
     // Keep the floor arrow under the soldier and aligned to their facing.
     const fp = this.mesh.position;
     this.facingArrow.position.set(fp.x, 0.04, fp.z);
@@ -504,14 +515,21 @@ export class Enemy {
     }
   }
 
-  _updateHpBar(dt) {
+  _updateHpBar(dt, cameraYaw = 0) {
     const p = this.mesh.position;
     this.hpBarBg.position.set(p.x, 1.35, p.z);
-    this.hpBarFg.position.set(p.x, 1.35, p.z);
-    // Shrink the green bar from the centre toward the right (left anchor).
+    this.hpBarBg.rotation.y = cameraYaw;
     const ratio = Math.max(0, this.hp / this.maxHp);
     this.hpBarFg.scale.x = ratio;
-    this.hpBarFg.position.x = p.x - (this.hpBarW * (1 - ratio)) / 2;
+    // Left-anchored shrink — keep fg's left edge under bg's left edge after
+    // rotation. See mecha for the maths (three.js Y rotation convention).
+    const offset = this.hpBarW * (1 - ratio) / 2;
+    this.hpBarFg.position.set(
+      p.x - offset * Math.cos(cameraYaw),
+      1.35,
+      p.z + offset * Math.sin(cameraYaw),
+    );
+    this.hpBarFg.rotation.y = cameraYaw;
     if (this.hpTimer > 0) {
       this.hpTimer -= dt;
       if (this.hpTimer <= 0) {

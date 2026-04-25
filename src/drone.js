@@ -152,9 +152,16 @@ export class Drone {
       if (world.player) pool.push({ pos: world.player.position, ent: world.player, isPlayer: true });
       for (const e of world.enemies || []) if (e.alive && e.faction === 'friendly') pool.push({ pos: e.mesh.position, ent: e });
       for (const d of world.drones  || []) if (d !== this && d.alive && d.faction === 'friendly') pool.push({ pos: d.mesh.position, ent: d });
+      for (const m of world.mechas  || []) {
+        if (m.alive && m.faction === 'friendly') {
+          // A possessed mecha is the player for trigger purposes.
+          pool.push({ pos: m.mesh.position, ent: m, isPlayer: m.possessed === true });
+        }
+      }
     } else {
       for (const e of world.enemies || []) if (e.alive && e.faction === 'hostile') pool.push({ pos: e.mesh.position, ent: e });
       for (const d of world.drones  || []) if (d !== this && d.alive && d.faction === 'hostile') pool.push({ pos: d.mesh.position, ent: d });
+      for (const m of world.mechas  || []) if (m.alive && m.faction === 'hostile') pool.push({ pos: m.mesh.position, ent: m });
     }
     let best = null, bestDist = Infinity;
     const p = this.mesh.position;
@@ -320,7 +327,7 @@ export class Drone {
     this._avoidOthers(world, dt, map);
 
     this.updateConeMesh(map);
-    this._updateHpBar(dt);
+    this._updateHpBar(dt, world?.cameraYaw);
     const fp = this.mesh.position;
     this.facingArrow.position.set(fp.x, 0.04, fp.z);
     this.facingArrow.rotation.y = this.facing;
@@ -408,13 +415,20 @@ export class Drone {
     this.routePath        = null;
   }
 
-  _updateHpBar(dt) {
+  _updateHpBar(dt, cameraYaw = 0) {
     const p = this.mesh.position;
     this.hpBarBg.position.set(p.x, 1.7, p.z);
-    this.hpBarFg.position.set(p.x, 1.7, p.z);
+    this.hpBarBg.rotation.y = cameraYaw;
     const ratio = Math.max(0, this.hp / this.maxHp);
     this.hpBarFg.scale.x = ratio;
-    this.hpBarFg.position.x = p.x - (this.hpBarW * (1 - ratio)) / 2;
+    // Left-anchored shrink — see mecha for the rotated-frame offset maths.
+    const offset = this.hpBarW * (1 - ratio) / 2;
+    this.hpBarFg.position.set(
+      p.x - offset * Math.cos(cameraYaw),
+      1.7,
+      p.z + offset * Math.sin(cameraYaw),
+    );
+    this.hpBarFg.rotation.y = cameraYaw;
     if (this.hpTimer > 0) {
       this.hpTimer -= dt;
       if (this.hpTimer <= 0) {
