@@ -88,28 +88,27 @@ function obstacleAt(x, z) {
   return obstacleByCell.get(`${Math.round(z)},${Math.round(x)}`) || null;
 }
 
-// Drop the cells from both the index and the map grid so movement & vision
-// pass through the wreckage.
-function _retireObstacle(o) {
-  for (const c of o.cells) {
-    map.grid[c.row][c.col] = 0;
-    obstacleByCell.delete(`${c.row},${c.col}`);
-  }
+// Drop a single dead cell from both the index and the map grid so movement
+// & vision pass through that exact tile (without affecting the rest of the
+// obstacle structure).
+function _retireCell(cell) {
+  map.grid[cell.row][cell.col] = 0;
+  obstacleByCell.delete(`${cell.row},${cell.col}`);
 }
 
 function damageObstacleAt(x, z, n = 1) {
   const o = obstacleAt(x, z);
   if (!o || !o.alive) return false;
-  o.takeDamage(n);
-  if (!o.alive) _retireObstacle(o);
+  const dead = o.takeDamageAt(x, z, n);
+  if (dead) _retireCell(dead);
   return true;
 }
 
 function destroyObstacleAt(x, z) {
   const o = obstacleAt(x, z);
   if (!o || !o.alive) return false;
-  o.destroy();
-  _retireObstacle(o);
+  const dead = o.destroyCellAt(x, z);
+  if (dead) _retireCell(dead);
   return true;
 }
 
@@ -142,6 +141,41 @@ function makeMarker(color, x, z) {
 const spotAMarker = makeMarker(0x22ddff, spotACell.x, spotACell.y);
 const exitMarker  = makeMarker(0x77ff55, exitCell.x,  exitCell.y);
 exitMarker.visible = false;
+
+// ── Off-screen objective pointers ────────────────────────────────────────────
+// Tiny edge-pinned arrows that rotate to face the active objective when it's
+// outside the camera frustum. Hidden when the objective is on-screen so they
+// don't fight the world marker for attention.
+const arrowSpot = document.getElementById('arrow-spot');
+const arrowExit = document.getElementById('arrow-exit');
+const _projVec  = new THREE.Vector3();
+
+function updateObjectiveArrow(el, worldX, worldZ, visible) {
+  if (!visible) { el.style.opacity = '0'; return; }
+  // Project to NDC. If z > 1 the target is behind the camera — flip the
+  // direction so the arrow points the way you'd actually have to turn.
+  _projVec.set(worldX, 0.5, worldZ).project(camera);
+  let nx = _projVec.x, ny = _projVec.y;
+  const behind = _projVec.z > 1;
+  if (behind) { nx = -nx; ny = -ny; }
+  const onScreen =
+    !behind && Math.abs(nx) <= 0.95 && Math.abs(ny) <= 0.95;
+  if (onScreen) { el.style.opacity = '0'; return; }
+  // Push the point onto a screen-edge rectangle (with a small inset margin).
+  const margin = 0.08;
+  const limit  = 1 - margin;
+  const k = Math.max(Math.abs(nx), Math.abs(ny)) || 1;
+  const ex = (nx / k) * limit;
+  const ey = (ny / k) * limit;
+  const px = (ex + 1) * 0.5 * window.innerWidth;
+  const py = (1 - ey) * 0.5 * window.innerHeight;
+  // Triangle's transform-origin is its tip (left edge). Rotate to point at
+  // the target direction — atan2 in screen space (note the y flip).
+  const angle = Math.atan2(-ny, nx); // screen y is inverted
+  el.style.transform =
+    `translate(${px.toFixed(1)}px, ${py.toFixed(1)}px) rotate(${angle}rad)`;
+  el.style.opacity = '0.9';
+}
 
 // ── Hack points ──────────────────────────────────────────────────────────────
 const MAX_HACKS     = 5;
@@ -703,7 +737,7 @@ function animate() {
   if (tickPendingHack()) { renderer.render(scene, camera); return; }
   if (hacker.active)     { renderer.render(scene, camera); return; }
 
-  player.update(dt, map, doorBlocksPlayer);
+  player.update(dt, map, doorBlocksPlayer, battleMode);
 
   // Battle mode = some HOSTILE enemy is actively tracking the player. Friendly
   // enemies fighting other hostiles don't count — the player is allied with them.
@@ -713,15 +747,28 @@ function animate() {
     mechas.some(m => m.alive && m.alerted && m.faction === 'hostile');
   if (anyAlerted !== battleMode) { battleMode = anyAlerted; updateModeUI(); }
 
-  // SUPERHOT: enemies move at full speed with player, slow to 8% when player stops
+  // Battle time control — two speeds:
+  //   • Player MOVING (WASD) → full speed (dt).
+  //   • Anything else        → slow-mo at 8 %, including standing perfectly
+  //                            still. Movement is the only thing that
+  //                            unfreezes the world during a fight.
+  // Stealth mode always runs in real time.
   let worldDt = dt;
-  if (battleMode) {
-    const nominal = player.speed * dt;
-    const ratio   = nominal > 0.0001 ? player.lastMoveAmount / nominal : 0;
-    worldDt = dt * Math.max(ratio, 0.08); // never fully freeze — always 8% minimum
+  if (battleMode && !player.movedThisFrame) {
+    worldDt = dt * 0.08;
   }
 
-  const worldView = { player, enemies, drones, mechas, map, destroyObstacleAt };
+  // Aim line is only meaningful in combat — show it while battle is on.
+  player.aimLine.visible = battleMode;
+
+  // Entities pull `realDt` off the world view to rotate / cool down in real
+  // time even while the world is in slow-mo. Movement still uses worldDt so
+  // the slow-mo bargain holds.
+  const worldView = {
+    player, enemies, drones, mechas, map, destroyObstacleAt,
+    realDt: dt, battleMode,
+    debugOpen: debug.enabled, // forces every door to its open state
+  };
   for (const e of enemies) e.update(worldDt, map, worldView, game);
   for (const d of drones)  d.update(worldDt, map, worldView, game, time);
   for (const m of mechas)  m.update(worldDt, map, worldView, game);
@@ -755,6 +802,11 @@ function animate() {
     pos.z + Math.cos(CAM_YAW) * CAM_RADIUS
   );
   camera.lookAt(pos.x, 0.5, pos.z);
+
+  // Off-screen pointers — Spot A while it's still the goal, then the exit.
+  camera.updateMatrixWorld();
+  updateObjectiveArrow(arrowSpot, spotACell.x, spotACell.y, !foundSpotA);
+  updateObjectiveArrow(arrowExit, exitCell.x,  exitCell.y,   foundSpotA);
 
   // Hack point collection + animation
   for (const m of hackMeshes) {

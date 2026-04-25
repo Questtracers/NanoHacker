@@ -1,14 +1,17 @@
 import * as THREE from 'three';
 import { isWall, rayMarch, findPath, findValidFloor } from './map.js';
+import { makeFacingArrow } from './facing-arrow.js';
 
 const STEALTH_CONE_ANGLE = Math.PI / 4;
 const STEALTH_CONE_RANGE = 8;
 const BATTLE_CONE_ANGLE  = Math.PI / 3;
 const BATTLE_CONE_RANGE  = 13;
-const LOSE_SIGHT_TIME    = 2.5;
+const LOSE_SIGHT_TIME    = 4.5;
 const TURN_SPEED         = 1.6;
 const TURN_SPEED_FAST    = 7.0;
 const TURN_BOOST_TIME    = 0.5;
+const TURN_THRESHOLD     = 0.18;
+const AIM_SAMPLE_INTERVAL = 0.55; // s of real time between aim re-locks (mecha is slow)
 const LEASH_RANGE        = 4.5;  // stays within this many cells of spawn while idle
 const NEARBY_ALERT_RANGE = 9;    // wakes up if any other hostile gets alerted within this
 const SPREAD             = Math.PI * 40 / 180; // ±40° fan for the side bullets
@@ -63,6 +66,12 @@ export class Mecha {
     this.coneMesh.renderOrder = 2;
     scene.add(this.coneMesh);
 
+    // Big floor arrow — same triangle as the soldier but scaled up since
+    // the mecha is huge.
+    this.facingArrow = makeFacingArrow(0xff3344, 0.85);
+    this.facingArrow.scale.setScalar(1.6);
+    scene.add(this.facingArrow);
+
     // Bullets hit anywhere within the body footprint, not just the centre.
     this.hitRadius = BODY_SIZE / 2;
 
@@ -81,6 +90,10 @@ export class Mecha {
     this.losingSightTimer = 0;
     this.shootCooldown    = 1.5;
     this.shootInterval    = 1.5;
+    // Lagged aim — between samples the mecha keeps swinging toward the
+    // LAST known target spot, so the player can outrun the lock-on.
+    this.aimedPos         = null;
+    this.aimSampleTimer   = 0;
     this.faction = 'hostile';
 
     // HP — 8 hitpoints. Bar shows briefly after damage / on hack.
@@ -112,12 +125,16 @@ export class Mecha {
     const dx = tx - p.x, dz = tz - p.z;
     const dist = Math.hypot(dx, dz);
     const range = this.alerted ? BATTLE_CONE_RANGE : STEALTH_CONE_RANGE;
-    const half  = this.alerted ? BATTLE_CONE_ANGLE  : STEALTH_CONE_ANGLE;
     if (dist > range) return false;
-    let diff = Math.atan2(dx, dz) - this.facing;
-    while (diff >  Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    if (Math.abs(diff) > half) return false;
+    // Stealth detection requires the visual cone. Once alerted, the mecha
+    // holds focus on any target within range + LOS — only cover breaks the
+    // lock, not the player's lateral movement.
+    if (!this.alerted) {
+      let diff = Math.atan2(dx, dz) - this.facing;
+      while (diff >  Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      if (Math.abs(diff) > STEALTH_CONE_ANGLE) return false;
+    }
     return rayMarch(map, p.x, p.z, dx / dist, dz / dist, dist) >= dist - 0.1;
   }
 
@@ -238,8 +255,10 @@ export class Mecha {
     return false;
   }
 
-  _shootFan(dx, dz, dist, game, owner = 'enemy') {
-    const angle = Math.atan2(dx, dz);
+  _shootFan(game, owner = 'enemy') {
+    // Fan is centred on the mecha's actual facing — it has to turn toward
+    // its target before shots line up.
+    const angle = this.facing;
     const aim = (a) => game.spawnBullet(
       this.mesh.position.x, this.mesh.position.z,
       Math.sin(a), Math.cos(a), owner, this,
@@ -249,8 +268,18 @@ export class Mecha {
     aim(angle + SPREAD);
   }
 
+  _facingError() {
+    let diff = this.targetFacing - this.facing;
+    while (diff >  Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    return Math.abs(diff);
+  }
+
   update(dt, map, world, game) {
     if (!this.alive) return;
+    // Real dt for rotation + shoot cadence so wind-up reads honestly during
+    // slow-mo. Movement still uses dt (worldDt).
+    const realDt = world?.realDt ?? dt;
 
     // Inherit alert state from any nearby alerted entity OF THE OPPOSITE
     // FACTION — a hostile mecha wakes up when an allied hostile spots the
@@ -281,19 +310,40 @@ export class Mecha {
       const dx   = target.pos.x - this.mesh.position.x;
       const dz   = target.pos.z - this.mesh.position.z;
       const dist = Math.hypot(dx, dz);
-      this.targetFacing = Math.atan2(dx, dz);
-      // Roll forward when the target is far away, hold ground when close.
-      if (dist > 3.5) this._tryMove(dx / dist, dz / dist, dt, map, world);
 
+      // Lagged aim sample — mecha doesn't track the player perfectly. It
+      // commits to a position, swings the turret there (real time), then
+      // re-samples. Gives the player a window to slip the cone.
+      if (!this.aimedPos) this.aimedPos = { x: target.pos.x, z: target.pos.z };
+      this.aimSampleTimer -= realDt;
+      if (this.aimSampleTimer <= 0) {
+        this.aimedPos.x = target.pos.x;
+        this.aimedPos.z = target.pos.z;
+        this.aimSampleTimer = AIM_SAMPLE_INTERVAL;
+      }
+      const ax = this.aimedPos.x - this.mesh.position.x;
+      const az = this.aimedPos.z - this.mesh.position.z;
+      this.targetFacing = Math.atan2(ax, az);
+
+      // Mecha is a tank — it rotates first (real-time, no movement) and only
+      // rolls / fires once aimed. The slow turn doubles as the player's
+      // dodge window.
+      const aligned = this._facingError() < TURN_THRESHOLD;
+      if (aligned && dist > 3.5) this._tryMove(dx / dist, dz / dist, dt, map, world);
+
+      // Shoot cadence ticks with worldDt so slow-mo / pause slows reload.
       this.shootCooldown -= dt;
-      if (this.shootCooldown <= 0 && dist < BATTLE_CONE_RANGE) {
+      if (aligned && this.shootCooldown <= 0 && dist < BATTLE_CONE_RANGE) {
         // Friendly mechas shoot bullets that can damage hostiles, hostile
         // mechas shoot enemy-coloured bullets that hit the player + allies.
         const owner = this.faction === 'friendly' ? 'player' : 'enemy';
-        this._shootFan(dx, dz, dist, game, owner);
+        this._shootFan(game, owner);
         this.shootCooldown = this.shootInterval;
       }
     } else if (this.alerted) {
+      // Drop the cached aim so a re-acquire starts a fresh sample.
+      this.aimedPos       = null;
+      this.aimSampleTimer = 0;
       this.losingSightTimer += dt;
       // Drift forward in the last facing direction while searching.
       this._tryMove(Math.sin(this.facing), Math.cos(this.facing), dt * 0.4, map, world);
@@ -339,9 +389,25 @@ export class Mecha {
       }
     }
 
-    this._smoothTurn(dt);
+    // Rotation:
+    //   • Tracking a visible target → real-time, throttled to 20 % during
+    //     slow-mo so the turret correction is clearly slow.
+    //   • Alerted-but-blocked       → worldDt, so the cone doesn't sweep
+    //     over the player and reset the de-alert timer.
+    const seesTargetNow = !!target;
+    const inSlowMo = dt + 1e-6 < realDt;
+    const turnDt = seesTargetNow
+      ? (inSlowMo ? realDt * 0.2 : realDt)
+      : dt;
+    this._smoothTurn(turnDt);
     this.updateConeMesh(map);
     this._updateHpBar(dt);
+
+    // Sync the floor arrow to the body's footing and current facing.
+    const fp = this.mesh.position;
+    this.facingArrow.position.set(fp.x, 0.04, fp.z);
+    this.facingArrow.rotation.y = this.facing;
+    this.facingArrow.visible    = this.alive;
   }
 
   _updateHpBar(dt) {
@@ -392,10 +458,11 @@ export class Mecha {
   }
 
   kill() {
-    this.alive            = false;
-    this.mesh.visible     = false;
-    this.coneMesh.visible = false;
-    this.hpBarBg.visible  = false;
-    this.hpBarFg.visible  = false;
+    this.alive               = false;
+    this.mesh.visible        = false;
+    this.coneMesh.visible    = false;
+    this.facingArrow.visible = false;
+    this.hpBarBg.visible     = false;
+    this.hpBarFg.visible     = false;
   }
 }

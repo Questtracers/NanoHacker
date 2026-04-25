@@ -106,7 +106,10 @@ export class Door {
 
   update(dt, world) {
     let target = this.hacked ? 1 : 0;
-    if (!this.hacked) {
+    // Debug toggle holds every door open without touching the hacked flag,
+    // so flipping debug off restores normal behaviour.
+    if (world?.debugOpen) target = 1;
+    if (!this.hacked && target !== 1) {
       // Auto-open when any soldier or drone is about to cross. Axis-aligned
       // box matching the door's 3-cell footprint.
       const all = (world.enemies || []).concat(world.drones || []);

@@ -14,6 +14,21 @@
   #hud .mode { font-weight: bold; }
   #hud .stealth { color: #6ef; }
   #hud .battle  { color: #f66; }
+  /* Off-screen objective pointers — small triangles pinned to the screen
+     edge that rotate to face their target. Positioned each frame from JS. */
+  .objArrow {
+    position: fixed; left: 0; top: 0; z-index: 12;
+    width: 0; height: 0;
+    /* triangle pointing right by default; rotation is applied via transform */
+    border-left:   18px solid currentColor;
+    border-top:    11px solid transparent;
+    border-bottom: 11px solid transparent;
+    pointer-events: none;
+    transform-origin: 0% 50%;
+    filter: drop-shadow(0 0 6px currentColor);
+    transition: opacity 0.18s linear;
+    opacity: 0;
+  }
   #overlay {
     position: fixed; inset: 0; display: none; z-index: 20;
     background: rgba(0,0,0,0.75); color: #fff;
@@ -44,6 +59,8 @@
   <div id="shot" style="color:#7ff">Shot: <b>READY</b></div>
   <div style="opacity:.75">WASD move • SPACE shoot • R hack • TAB debug</div>
 </div>
+<div class="objArrow" id="arrow-spot"  style="color:#22ddff"></div>
+<div class="objArrow" id="arrow-exit"  style="color:#77ff55"></div>
 <div id="overlay">
   <div id="overlay-text">You were eliminated</div>
   <button onclick="location.reload()">New Run</button>

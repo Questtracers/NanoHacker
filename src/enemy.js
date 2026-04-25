@@ -1,16 +1,18 @@
 import * as THREE from 'three';
 import { isWall, rayMarch, findPath, findValidFloor } from './map.js';
+import { makeFacingArrow } from './facing-arrow.js';
 
 const STEALTH_CONE_ANGLE = Math.PI / 4;
 const STEALTH_CONE_RANGE = 7;
 const BATTLE_CONE_ANGLE  = Math.PI / 3;
 const BATTLE_CONE_RANGE  = 12;
-const LOSE_SIGHT_TIME    = 2.0;
+const LOSE_SIGHT_TIME    = 4.0;
 const WAIT_TIME          = 1.5;
 const TURN_SPEED         = 2.5;
 const TURN_SPEED_FAST    = 9.0; // boost rate when reacting to bullets
 const TURN_BOOST_TIME    = 0.45;
 const TURN_THRESHOLD     = 0.18; // rad — must be within ~10° before moving
+const AIM_SAMPLE_INTERVAL = 0.45; // s of real time between aim re-locks
 
 export class Enemy {
   constructor(scene, x, z) {
@@ -41,6 +43,10 @@ export class Enemy {
     this.coneMesh.renderOrder = 2;
     scene.add(this.coneMesh);
 
+    // Floor arrow indicating which way the enemy is currently aimed.
+    this.facingArrow = makeFacingArrow(0xff5555, 0.85);
+    scene.add(this.facingArrow);
+
     this.facing          = Math.random() * Math.PI * 2;
     this.targetFacing    = this.facing;
     // During a short window after a bullet grazes us the cone swings at a
@@ -57,6 +63,11 @@ export class Enemy {
     this.alerted          = false;
     this.losingSightTimer = 0;
     this.shootCooldown    = 1.0;
+    // Aim is re-sampled on a real-time interval — between samples the soldier
+    // keeps swinging toward where it last saw the target, so a moving player
+    // can break the lock-on instead of the cone tracking them perfectly.
+    this.aimedPos         = null;
+    this.aimSampleTimer   = 0;
     // While alerted, the soldier follows a BFS path toward the player so it
     // doesn't crash into walls. Recomputed periodically as the player moves.
     this.chasePath      = null;
@@ -128,12 +139,18 @@ export class Enemy {
     const dx = tx - p.x, dz = tz - p.z;
     const dist = Math.hypot(dx, dz);
     const range = this.alerted ? BATTLE_CONE_RANGE : STEALTH_CONE_RANGE;
-    const half  = this.alerted ? BATTLE_CONE_ANGLE  : STEALTH_CONE_ANGLE;
     if (dist > range) return false;
-    let diff = Math.atan2(dx, dz) - this.facing;
-    while (diff >  Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    if (Math.abs(diff) > half) return false;
+    // Stealth requires the target to actually be inside the visual cone.
+    // Once ALERTED, we hold focus on anyone within range + line-of-sight —
+    // the cone-angle constraint drops away so the player can't break tracking
+    // just by side-stepping. Cover (a wall blocking the ray) is the only way
+    // out of the lock.
+    if (!this.alerted) {
+      let diff = Math.atan2(dx, dz) - this.facing;
+      while (diff >  Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      if (Math.abs(diff) > STEALTH_CONE_ANGLE) return false;
+    }
     return rayMarch(map, p.x, p.z, dx / dist, dz / dist, dist) >= dist - 0.1;
   }
 
@@ -277,6 +294,11 @@ export class Enemy {
     // Back-compat: if the host still passes the player directly, wrap it.
     if (world && !world.player && world.position) world = { player: world };
 
+    // Rotation + shooting cadence run in real time so the player can read the
+    // wind-up during slow-mo. Movement still uses dt (worldDt) to honour the
+    // SUPERHOT bargain.
+    const realDt = world?.realDt ?? dt;
+
     const target = this._findVisibleTarget(world, map);
     const seesTarget = target !== null;
 
@@ -295,16 +317,41 @@ export class Enemy {
       const dx   = target.pos.x - this.mesh.position.x;
       const dz   = target.pos.z - this.mesh.position.z;
       const dist = Math.hypot(dx, dz);
-      this.targetFacing = Math.atan2(dx, dz);
-      // Pathfind toward the target instead of charging straight at it. This
-      // makes the soldier round walls / corners cleanly rather than mashing
-      // into them. Path is recomputed every ~0.4 s as the player moves.
-      if (dist > 3.5) this._chaseStep(dx, dz, dist, dt, map, target.pos);
 
+      // Aim is re-sampled on a real-time interval. Between samples the
+      // soldier keeps rotating toward the LAST known target position, so a
+      // moving player can break the lock-on rather than the cone snapping
+      // onto them every frame.
+      if (!this.aimedPos) this.aimedPos = { x: target.pos.x, z: target.pos.z };
+      this.aimSampleTimer -= realDt;
+      if (this.aimSampleTimer <= 0) {
+        this.aimedPos.x = target.pos.x;
+        this.aimedPos.z = target.pos.z;
+        this.aimSampleTimer = AIM_SAMPLE_INTERVAL;
+      }
+      const ax = this.aimedPos.x - this.mesh.position.x;
+      const az = this.aimedPos.z - this.mesh.position.z;
+      this.targetFacing = Math.atan2(ax, az);
+
+      // Combat is split into two phases: rotate (real-time, no movement, no
+      // shots) until aligned, then chase + fire. So the player gets a clear,
+      // visible "cone swinging onto me" tell before bullets start coming.
+      const aligned = this._facingError() < TURN_THRESHOLD;
+      if (aligned && dist > 3.5) {
+        this._chaseStep(dx, dz, dist, dt, map, target.pos);
+      }
+
+      // Shoot cadence ticks with worldDt — when the player stops moving and
+      // the world freezes, the reload freezes with it.
       this.shootCooldown -= dt;
-      if (this.shootCooldown <= 0 && dist < BATTLE_CONE_RANGE) {
+      if (aligned && this.shootCooldown <= 0 && dist < BATTLE_CONE_RANGE) {
+        // Always fire along the soldier's actual facing — they have to turn
+        // (via _smoothTurn) to land hits, so the player can dodge during the
+        // wind-up if they read the cone's swing.
         const owner = this.faction === 'friendly' ? 'player' : 'enemy';
-        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, dx / dist, dz / dist, owner, this);
+        const fx = Math.sin(this.facing);
+        const fz = Math.cos(this.facing);
+        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, fx, fz, owner, this);
         this.burstRemaining--;
         if (this.burstRemaining <= 0) {
           this.burstRemaining = 3;
@@ -315,6 +362,10 @@ export class Enemy {
       }
 
     } else if (this.alerted) {
+      // Lost line of sight: forget the cached aim so the next acquisition
+      // starts a fresh sample interval (rather than instantly snapping).
+      this.aimedPos       = null;
+      this.aimSampleTimer = 0;
       this.losingSightTimer += dt;
       if (this.losingSightTimer >= LOSE_SIGHT_TIME) {
         this.alerted          = false;
@@ -371,9 +422,24 @@ export class Enemy {
     // Soft separation from other living entities so soldiers don't pile up.
     this._avoidOthers(world, dt, map);
 
-    this._smoothTurn(dt);
+    // Rotation:
+    //   • Tracking a visible target → real-time, but throttled to 20 % when
+    //     the world is in slow-mo so the cone correction reads as a slow,
+    //     deliberate sweep instead of a snap. Player has time to dodge.
+    //   • Alerted-but-blocked       → worldDt, so the cone doesn't sweep
+    //     over the player and reset the de-alert timer.
+    const inSlowMo = dt + 1e-6 < realDt;
+    const turnDt = seesTarget
+      ? (inSlowMo ? realDt * 0.2 : realDt)
+      : dt;
+    this._smoothTurn(turnDt);
     this.updateConeMesh(map);
     this._updateHpBar(dt);
+    // Keep the floor arrow under the soldier and aligned to their facing.
+    const fp = this.mesh.position;
+    this.facingArrow.position.set(fp.x, 0.04, fp.z);
+    this.facingArrow.rotation.y = this.facing;
+    this.facingArrow.visible    = this.alive;
   }
 
   // Chase a moving target via a periodically-recomputed BFS path. Falls back
@@ -499,10 +565,11 @@ export class Enemy {
   }
 
   kill() {
-    this.alive            = false;
-    this.mesh.visible     = false;
-    this.coneMesh.visible = false;
-    this.hpBarBg.visible  = false;
-    this.hpBarFg.visible  = false;
+    this.alive               = false;
+    this.mesh.visible        = false;
+    this.coneMesh.visible    = false;
+    this.facingArrow.visible = false;
+    this.hpBarBg.visible     = false;
+    this.hpBarFg.visible     = false;
   }
 }

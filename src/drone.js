@@ -1,14 +1,18 @@
 import * as THREE from 'three';
 import { isWall, rayMarch, findValidFloor, findPath } from './map.js';
+import { makeFacingArrow } from './facing-arrow.js';
 
 const STEALTH_CONE_ANGLE = Math.PI / 8; // half the soldier's spread
 const BATTLE_CONE_ANGLE  = Math.PI / 6;
 const STEALTH_CONE_RANGE = 6;
 const BATTLE_CONE_RANGE  = 10;
-const LOSE_SIGHT_TIME    = 1.8;
+const LOSE_SIGHT_TIME    = 3.5;
 const CONE_ROT_SPEED     = 1.4; // rad/s, clockwise sweep
+const TURN_SPEED         = 3.0; // rad/s when locking onto a target
 const TURN_SPEED_FAST    = 9.0; // rad/s when reacting to a bullet
 const TURN_BOOST_TIME    = 0.45;
+const TURN_THRESHOLD     = 0.18;
+const AIM_SAMPLE_INTERVAL = 0.35; // s of real time between aim re-locks
 
 export class Drone {
   constructor(scene, x, z, firstTarget = null) {
@@ -45,6 +49,10 @@ export class Drone {
     this.coneMesh.renderOrder = 2;
     scene.add(this.coneMesh);
 
+    // Floor arrow following the cone — useful since drones spin a lot.
+    this.facingArrow = makeFacingArrow(0xff66cc, 0.85);
+    scene.add(this.facingArrow);
+
     // Continuous clockwise rotation — independent of movement direction.
     this.facing          = Math.random() * Math.PI * 2;
     this.bulletFacing    = null; // transient override when reacting to bullets
@@ -63,6 +71,10 @@ export class Drone {
     // Drones fire one shot at a time, slightly faster than soldier bursts.
     this.shootCooldown    = 0.80;
     this.shootInterval    = 0.80;
+    // Lagged aim — between samples the drone keeps rotating to the LAST
+    // sighted target position, so the player can dodge the lock-on by moving.
+    this.aimedPos         = null;
+    this.aimSampleTimer   = 0;
 
     this.maxHp   = 2;
     this.hp      = this.maxHp;
@@ -121,12 +133,16 @@ export class Drone {
     const dx = tx - p.x, dz = tz - p.z;
     const dist = Math.hypot(dx, dz);
     const range = this.alerted ? BATTLE_CONE_RANGE : STEALTH_CONE_RANGE;
-    const half  = this.alerted ? BATTLE_CONE_ANGLE  : STEALTH_CONE_ANGLE;
     if (dist > range) return false;
-    let diff = Math.atan2(dx, dz) - this.facing;
-    while (diff >  Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    if (Math.abs(diff) > half) return false;
+    // Stealth: must be inside the visual cone. Alerted: hold focus on any
+    // target within range + line-of-sight, regardless of angle, so the
+    // drone keeps tracking a moving player until cover breaks the LOS.
+    if (!this.alerted) {
+      let diff = Math.atan2(dx, dz) - this.facing;
+      while (diff >  Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      if (Math.abs(diff) > STEALTH_CONE_ANGLE) return false;
+    }
     return rayMarch(map, p.x, p.z, dx / dist, dz / dist, dist) >= dist - 0.1;
   }
 
@@ -188,6 +204,10 @@ export class Drone {
     if (!this.alive) return;
     if (world && !world.player && world.position) world = { player: world };
 
+    // Real dt for rotation + shoot cooldown so the lock-on tell stays visible
+    // and reload pacing is honest even while the world is in slow-mo.
+    const realDt = world?.realDt ?? dt;
+
     // Gentle hover bob — purely cosmetic.
     this.mesh.position.y = this.hoverBase + Math.sin(time * 3.0 + this.mesh.position.x) * 0.08;
 
@@ -195,6 +215,7 @@ export class Drone {
     // Bullet boost overrides every other facing logic for a short window so
     // the cone swings fast toward the bullet's source without teleporting.
     const boosting = this.turnBoostTimer > 0 && this.bulletFacing !== null;
+    let aligned = false;
     if (target) {
       const wasAlerted = this.alerted;
       this.alerted          = true;
@@ -205,37 +226,72 @@ export class Drone {
       const dz   = target.pos.z - this.mesh.position.z;
       const dist = Math.hypot(dx, dz);
 
-      // Lock the cone onto the target while we can see them — unless the
-      // drone is still mid-reacting to a bullet.
-      if (!boosting) this.facing = Math.atan2(dx, dz);
+      // Lagged aim sample: latch the target position every AIM_SAMPLE_INTERVAL
+      // seconds (real time) and rotate toward the LATCH, not the live target.
+      // A moving player can stay ahead of the cone instead of being snap-tracked.
+      if (!this.aimedPos) this.aimedPos = { x: target.pos.x, z: target.pos.z };
+      this.aimSampleTimer -= realDt;
+      if (this.aimSampleTimer <= 0) {
+        this.aimedPos.x = target.pos.x;
+        this.aimedPos.z = target.pos.z;
+        this.aimSampleTimer = AIM_SAMPLE_INTERVAL;
+      }
+      const ax = this.aimedPos.x - this.mesh.position.x;
+      const az = this.aimedPos.z - this.mesh.position.z;
+      const wantFacing = Math.atan2(ax, az);
+
+      let diff = wantFacing - this.facing;
+      while (diff >  Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      aligned = Math.abs(diff) < TURN_THRESHOLD;
+      if (!boosting) {
+        // Real-time turn, throttled to 20 % during slow-mo so the cone
+        // correction is visibly slow rather than a snap.
+        const inSlowMo = dt + 1e-6 < realDt;
+        const turnRate = TURN_SPEED * (inSlowMo ? 0.2 : 1);
+        this.facing += Math.sign(diff) * Math.min(Math.abs(diff), turnRate * realDt);
+      }
 
       // Chase via a periodically-refreshed BFS path so the drone rounds
-      // corners cleanly instead of pressing into walls when the player
-      // breaks line-of-sight around a turn.
-      if (dist > 2.2) {
+      // corners cleanly. Movement is gated on alignment — drones can't fly
+      // and rotate at the same time.
+      if (aligned && dist > 2.2) {
         this._chaseStep(dt, map, target.pos);
       }
 
-      // Fire rapid single shots while in range.
+      // Fire rapid single shots while in range AND aimed. Cooldown ticks
+      // with worldDt — slow-mo / pause slows the next shot too.
       this.shootCooldown -= dt;
-      if (this.shootCooldown <= 0 && dist < BATTLE_CONE_RANGE) {
+      if (aligned && this.shootCooldown <= 0 && dist < BATTLE_CONE_RANGE) {
+        // Bullets come out along the drone's current facing — its cone has
+        // to lock on the target before shots will actually connect.
         const owner = this.faction === 'friendly' ? 'player' : 'enemy';
-        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, dx / dist, dz / dist, owner, this);
+        const fx = Math.sin(this.facing);
+        const fz = Math.cos(this.facing);
+        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, fx, fz, owner, this);
         this.shootCooldown = this.shootInterval;
       }
       // Clear any stale wander route so we start fresh once alert ends.
       this.routePath = null;
     } else {
+      // Forget the cached aim so a re-acquire starts fresh instead of using
+      // a stale snapshot.
+      this.aimedPos       = null;
+      this.aimSampleTimer = 0;
       if (this.alerted) {
+        // Losing-sight timer ticks on WORLD time (worldDt) so slow-mo
+        // stretches the de-alert just like it stretches everything else.
         this.losingSightTimer += dt;
         if (this.losingSightTimer >= LOSE_SIGHT_TIME) {
           this.alerted          = false;
           this.losingSightTimer = 0;
         }
       }
-      // Cone sweeps clockwise when NOT locked onto the player — unless the
-      // drone is still mid-reacting to a bullet.
-      if (!boosting) this.facing -= CONE_ROT_SPEED * dt;
+      // Cone sweep — real-time during stealth (so the player can read the
+      // sweep). While alerted-but-blocked the cone holds still: a sweeping
+      // cone would keep re-acquiring the player every rotation and reset
+      // the de-alert timer, which isn't what we want during slow-mo.
+      if (!boosting && !this.alerted) this.facing -= CONE_ROT_SPEED * realDt;
 
       // Wander via BFS routes — soldier-style corridor following, random dests.
       if (!this.routePath || this.pathPos >= this.routePath.length) {
@@ -249,12 +305,13 @@ export class Drone {
     }
 
     // Apply the fast smooth turn toward the bullet source if one was queued.
+    // Real-time so the snap-look reads as a quick reaction even in slow-mo.
     if (boosting) {
       let diff = this.bulletFacing - this.facing;
       while (diff >  Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
-      this.facing += Math.sign(diff) * Math.min(Math.abs(diff), TURN_SPEED_FAST * dt);
-      this.turnBoostTimer -= dt;
+      this.facing += Math.sign(diff) * Math.min(Math.abs(diff), TURN_SPEED_FAST * realDt);
+      this.turnBoostTimer -= realDt;
       if (this.turnBoostTimer <= 0) this.bulletFacing = null;
     }
 
@@ -264,6 +321,10 @@ export class Drone {
 
     this.updateConeMesh(map);
     this._updateHpBar(dt);
+    const fp = this.mesh.position;
+    this.facingArrow.position.set(fp.x, 0.04, fp.z);
+    this.facingArrow.rotation.y = this.facing;
+    this.facingArrow.visible    = this.alive;
   }
 
   _chaseStep(dt, map, targetPos) {
@@ -373,10 +434,11 @@ export class Drone {
   }
 
   kill() {
-    this.alive            = false;
-    this.mesh.visible     = false;
-    this.coneMesh.visible = false;
-    this.hpBarBg.visible  = false;
-    this.hpBarFg.visible  = false;
+    this.alive               = false;
+    this.mesh.visible        = false;
+    this.coneMesh.visible    = false;
+    this.facingArrow.visible = false;
+    this.hpBarBg.visible     = false;
+    this.hpBarFg.visible     = false;
   }
 }
