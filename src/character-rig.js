@@ -137,6 +137,14 @@ export class CharacterRig {
     // source + 4 stealth striders + 5 battle + hack + recoil + 2 deaths
     // + 2 hit reactions (crouch + battle).
     this._loadTotal = 1 + 4 + 5 + 1 + 1 + 2 + 2;
+
+    // Mixamo bone-prefix detected from the source FBX. Each Mixamo
+    // upload of the same model can produce a different prefix
+    // (`mixamorig:` / `mixamorig1:` / ...). If an animation FBX comes
+    // from a different upload the track names won't match the rig's
+    // skeleton, the action plays at full weight, and you get a T-pose.
+    // _normalizeClipTracks rewrites them on the fly.
+    this._canonicalPrefix = '';
   }
 
   // ── Public getters / setters ─────────────────────────────────────────
@@ -321,8 +329,11 @@ export class CharacterRig {
             // _dying here. Caller invokes resetDeath() on respawn.
           });
 
-          // Source FBX's first clip = stealth idle.
+          // Source FBX's first clip = stealth idle. Capture the canonical
+          // bone prefix BEFORE attaching anything else so later clips can
+          // be normalised to match.
           const sourceClip = fbx.animations?.[0];
+          this._canonicalPrefix = this._detectPrefix(sourceClip);
           if (sourceClip) this._attach('stealth.idle', sourceClip);
 
           oneDone();
@@ -500,9 +511,35 @@ export class CharacterRig {
   }
 
   // ── Internals ────────────────────────────────────────────────────────
+
+  // Look at the first track of the source clip and pull whatever Mixamo
+  // prefix is in use (`mixamorig:` / `mixamorig1:` / ...). Returns "" if
+  // there's no detectable prefix.
+  _detectPrefix(clip) {
+    if (!clip || !clip.tracks?.length) return '';
+    const first = clip.tracks[0].name;
+    const colon = first.indexOf(':');
+    return (colon > 0) ? first.slice(0, colon + 1) : '';
+  }
+
+  // Rewrite every track's prefix to match the rig's canonical one.
+  // Without this, an animation FBX from a different Mixamo upload won't
+  // bind to this rig's skeleton — action plays at full weight but the
+  // skeleton stays in bind pose (T-pose).
+  _normalizeClipTracks(clip) {
+    if (!clip || !clip.tracks?.length) return;
+    const canonical = this._canonicalPrefix;
+    if (!canonical) return;
+    const re = /^mixamorig\d*:/;
+    for (const t of clip.tracks) {
+      if (re.test(t.name)) t.name = t.name.replace(re, canonical);
+    }
+  }
+
   _attach(slot, clip) {
     if (!clip || !this._mixer) return null;
     clip.name = slot;
+    this._normalizeClipTracks(clip);
     // Additive clips: their pose is interpreted as a DELTA from frame 0
     // and the mixer adds that delta onto whatever else is playing. This
     // is what lets the character fire / take a hit while still walking

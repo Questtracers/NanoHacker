@@ -1,30 +1,36 @@
 import * as THREE from 'three';
-import { CharacterRig } from './character-rig.js';
+import { SoldierRig } from './soldier-rig.js';
 
-// Empty test arena. The character rig is now fully owned by CharacterRig
-// (`./character-rig.js`); this file just builds a stage and routes input
-// into the rig's setters. Same module powers the player in the main game,
-// so anything that works here works there.
+// Debug arena — soldier behaviour preview.
+//
+// One SoldierRig is dropped onto an empty floor and walks a randomly-
+// generated polygon route, pausing briefly at each waypoint. The blend
+// tree picks idle / forward / back / left / right based on the soldier's
+// movement projected onto its facing — so corner-rounding triggers brief
+// strafe contributions automatically.
 //
 // Controls:
-//   • WASD       — camera-relative move
-//   • Q / E      — rotate facing
-//   • R (tap)    — play the hack animation (movement interrupts)
-//   • TAB        — toggle stealth ⇄ battle mode
-//   • M          — fire shot (additive recoil overlay)
-//   • N          — take a hit (additive overlay; crouch / battle variant)
-//   • U          — die falling backwards
-//   • I          — die falling forwards
+//   • WASD       — pan the camera (camera-relative)
+//   • TAB        — toggle soldier's normal / battle locomotion bundle
+//   • P          — toggle the route gizmos (line + waypoint markers)
+//   • T          — soldier fires the rifle (additive overlay)
+//   • H          — soldier takes a hit (variant chosen by current mode)
+//   • N          — soldier dies (one-shot, locks the rig in death pose)
 
-const CAM_YAW    = Math.PI * 75 / 180;
-const CAM_RADIUS = 9;
-const CAM_HEIGHT = 7.5;
-const MOVE_SPEED = 2.5;
-const TURN_SPEED = Math.PI;
+const CAM_YAW       = Math.PI * 75 / 180;
+const CAM_RADIUS    = 12;
+const CAM_HEIGHT    = 9;
+const CAM_PAN_SPEED = 6;
+
+const SOLDIER_SPEED      = 1.6;        // m/s while walking
+const SOLDIER_TURN_RATE  = Math.PI;    // rad/s — facing chases movement direction
+const PAUSE_AT_WAYPOINT  = 1.2;        // s of idle between segments
+const ROUTE_HALF_EXTENT  = 10;         // route fits inside ±10 m around origin
+const NUM_WAYPOINTS      = 5;
+const TARGET_REACH       = 0.4;        // m — distance to consider waypoint hit
 
 export function runDebugLevel() {
-  // Tell the main game module to stand down — its animate loop and key
-  // listeners (R, F, SPACE, TAB) early-return on this flag.
+  // Tell the main game module to stand down.
   window.__nanoDebugLevel = true;
 
   // Hide whatever the main game already mounted at module-load time.
@@ -94,25 +100,78 @@ export function runDebugLevel() {
   hint.style.cssText = hud.style.cssText.replace('top:10px', 'bottom:10px');
   hint.innerHTML =
     '<b style="color:#0ff">Controls</b> ' +
-    'WASD move • Q/E rotate • R hack • TAB stealth/battle • M shoot • N hit • U/I die back/front';
+    'WASD pan • TAB normal/battle • P route • T fire • H hit • N die';
   document.body.appendChild(hint);
 
-  function setHud(rig) {
-    const ready = rig.loaded;
-    const mode = rig.battleMode ? 'BATTLE' : 'STEALTH';
-    const modeColor = rig.battleMode ? '#f88' : '#7ef';
-    hud.innerHTML =
-      '<b style="color:#0ff">DEBUG LEVEL</b><br>' +
-      `loaded: <b>${(rig.loadProgress * 100).toFixed(0)}%</b>` +
-      (ready ? '' : ' …') + '<br>' +
-      `mode: <b style="color:${modeColor}">${mode}</b>`;
+  // ── Random patrol route ────────────────────────────────────────────────
+  const waypoints = [];
+  for (let i = 0; i < NUM_WAYPOINTS; i++) {
+    waypoints.push(new THREE.Vector3(
+      (Math.random() - 0.5) * ROUTE_HALF_EXTENT * 2,
+      0,
+      (Math.random() - 0.5) * ROUTE_HALF_EXTENT * 2,
+    ));
   }
 
-  // ── Character rig (the only piece that ports to the real game) ────────
-  const rig = new CharacterRig(scene, { moveSpeed: MOVE_SPEED });
-  rig.position = { x: 0, z: 0 };
-  rig.facing = Math.PI / 2;     // north — see character-rig.js for why
-  rig.load();
+  // Route gizmos — line connecting the waypoints (looped) plus a disc + pin
+  // at each. Toggleable via TAB.
+  const gizmos = [];
+  let gizmosVisible = false;
+
+  {
+    const ROUTE_COLOR = 0x66ffaa;
+    const pts = waypoints.map((w) => new THREE.Vector3(w.x, 0.05, w.z));
+    pts.push(pts[0]); // close the loop
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+    const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({
+      color: ROUTE_COLOR, transparent: true, opacity: 0.65,
+    }));
+    line.visible = gizmosVisible;
+    scene.add(line);
+    gizmos.push(line);
+
+    waypoints.forEach((w) => {
+      const disc = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.4, 0.4, 0.06, 20),
+        new THREE.MeshBasicMaterial({ color: ROUTE_COLOR }),
+      );
+      disc.position.set(w.x, 0.06, w.z);
+      disc.visible = gizmosVisible;
+      scene.add(disc);
+      gizmos.push(disc);
+
+      const pin = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.06, 0.06, 1.2, 8),
+        new THREE.MeshBasicMaterial({
+          color: ROUTE_COLOR, transparent: true, opacity: 0.55,
+        }),
+      );
+      pin.position.set(w.x, 0.7, w.z);
+      pin.visible = gizmosVisible;
+      scene.add(pin);
+      gizmos.push(pin);
+    });
+  }
+
+  function setGizmosVisible(v) {
+    gizmosVisible = v;
+    for (const g of gizmos) g.visible = v;
+  }
+
+  // ── Soldier rig (the only character in this debug arena) ──────────────
+  const soldier = new SoldierRig(scene, { moveSpeed: SOLDIER_SPEED });
+  soldier.position = waypoints[0];
+  // Aim initial facing at the next waypoint so the soldier doesn't have to
+  // spin on startup.
+  {
+    const dx = waypoints[1].x - waypoints[0].x;
+    const dz = waypoints[1].z - waypoints[0].z;
+    soldier.facing = Math.atan2(dx, dz);
+  }
+  soldier.load();
+
+  let currentWaypoint = 1;
+  let pauseTimer = 0;
 
   // ── Input ──────────────────────────────────────────────────────────────
   const keys = new Set();
@@ -120,69 +179,110 @@ export function runDebugLevel() {
     const k = e.key.toLowerCase();
     const wasDown = keys.has(k);
     keys.add(k);
-    if (k === 'r' && !wasDown) rig.triggerHack();
-    if (k === 'm' && !wasDown) rig.triggerRecoil();
-    if (k === 'n' && !wasDown) rig.triggerHit();
-    if (k === 'u' && !wasDown) rig.triggerDeath('back');
-    if (k === 'i' && !wasDown) rig.triggerDeath('front');
     if (e.key === 'Tab') {
       e.preventDefault();
-      rig.battleMode = !rig.battleMode;
+      soldier.battleMode = !soldier.battleMode;
     }
+    if (k === 'p' && !wasDown) setGizmosVisible(!gizmosVisible);
+    if (k === 't' && !wasDown) soldier.triggerFiring();
+    if (k === 'h' && !wasDown) soldier.triggerHit();
+    if (k === 'n' && !wasDown) soldier.triggerDeath();
   });
   window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
 
-  // ── Update / render loop ───────────────────────────────────────────────
-  let facing = Math.PI / 2;
-  const charPos = new THREE.Vector3(0, 0, 0);
+  // Camera target — WASD pans this; the camera follows at fixed offset.
+  const camTarget = new THREE.Vector3(
+    waypoints[0].x, 0.5, waypoints[0].z,
+  );
 
+  function setHud() {
+    const ready = soldier.loaded;
+    const mode = soldier.battleMode ? 'BATTLE' : 'NORMAL';
+    const modeColor = soldier.battleMode ? '#f88' : '#7ef';
+    hud.innerHTML =
+      '<b style="color:#0ff">DEBUG LEVEL — soldier preview</b><br>' +
+      `loaded: <b>${(soldier.loadProgress * 100).toFixed(0)}%</b>` +
+      (ready ? '' : ' …') + '<br>' +
+      `mode: <b style="color:${modeColor}">${mode}</b><br>` +
+      `waypoint: <b>${currentWaypoint + 1} / ${waypoints.length}</b>` +
+      (pauseTimer > 0
+        ? ` <span style="opacity:.7">(idle ${pauseTimer.toFixed(1)} s)</span>`
+        : '') + '<br>' +
+      `routes: <b>${gizmosVisible ? 'ON' : 'off'}</b>`;
+  }
+
+  // ── Update / render loop ───────────────────────────────────────────────
   const clock = new THREE.Clock();
   function tick() {
     requestAnimationFrame(tick);
     const dt = Math.min(clock.getDelta(), 0.05);
 
-    // Q/E rotation.
-    let turn = 0;
-    if (keys.has('q')) turn += 1;
-    if (keys.has('e')) turn -= 1;
-    if (turn) {
-      facing += turn * TURN_SPEED * dt;
-      while (facing >  Math.PI) facing -= Math.PI * 2;
-      while (facing < -Math.PI) facing += Math.PI * 2;
-    }
-
-    // WASD camera-relative movement.
+    // Camera pan via WASD (camera-relative — same swizzle the player uses
+    // in the main game so screen-up = world -X).
     let ix = 0, iz = 0;
     if (keys.has('w')) iz -= 1;
     if (keys.has('s')) iz += 1;
     if (keys.has('a')) ix -= 1;
     if (keys.has('d')) ix += 1;
     const len = Math.hypot(ix, iz);
-    let wx = 0, wz = 0;
     if (len > 0) {
       ix /= len; iz /= len;
-      wx =  iz;
-      wz = -ix;
-      charPos.x += wx * MOVE_SPEED * dt;
-      charPos.z += wz * MOVE_SPEED * dt;
+      camTarget.x += iz * CAM_PAN_SPEED * dt;
+      camTarget.z += -ix * CAM_PAN_SPEED * dt;
     }
 
-    // Push state into the rig and tick it.
-    rig.position = charPos;
-    rig.facing   = facing;
-    rig.setMovement(wx, wz);
-    rig.update(dt);
-
-    setHud(rig);
-
-    // Camera follow (isometric).
+    // Camera follows target.
     camera.position.set(
-      charPos.x + Math.sin(CAM_YAW) * CAM_RADIUS,
+      camTarget.x + Math.sin(CAM_YAW) * CAM_RADIUS,
       CAM_HEIGHT,
-      charPos.z + Math.cos(CAM_YAW) * CAM_RADIUS,
+      camTarget.z + Math.cos(CAM_YAW) * CAM_RADIUS,
     );
-    camera.lookAt(charPos.x, 1.0, charPos.z);
+    camera.lookAt(camTarget.x, 0.5, camTarget.z);
 
+    // ── Soldier route follower ───────────────────────────────────────
+    if (soldier.isDying) {
+      soldier.setMovement(0, 0);
+    } else if (pauseTimer > 0) {
+      pauseTimer -= dt;
+      soldier.setMovement(0, 0);
+    } else if (soldier.loaded) {
+      const target = waypoints[currentWaypoint];
+      const pos    = soldier.position;
+      const dx     = target.x - pos.x;
+      const dz     = target.z - pos.z;
+      const dist   = Math.hypot(dx, dz);
+      if (dist < TARGET_REACH) {
+        // Reached waypoint — pause briefly then advance to the next.
+        pauseTimer = PAUSE_AT_WAYPOINT;
+        currentWaypoint = (currentWaypoint + 1) % waypoints.length;
+        soldier.setMovement(0, 0);
+      } else {
+        // Step toward the waypoint at SOLDIER_SPEED.
+        const dirX = dx / dist;
+        const dirZ = dz / dist;
+        pos.x += dirX * SOLDIER_SPEED * dt;
+        pos.z += dirZ * SOLDIER_SPEED * dt;
+
+        // Smoothly turn the soldier's facing toward the movement direction.
+        // While the rotation lags the movement, the blend tree picks up
+        // the strafe components automatically (forward + a touch of left
+        // or right).
+        const targetFacing = Math.atan2(dirX, dirZ);
+        let diff = targetFacing - soldier.facing;
+        while (diff >  Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        const turnStep = Math.sign(diff) *
+                         Math.min(Math.abs(diff), SOLDIER_TURN_RATE * dt);
+        soldier.facing = soldier.facing + turnStep;
+
+        // Tell the rig the world-space movement direction so its blend
+        // tree can resolve forward / back / left / right.
+        soldier.setMovement(dirX, dirZ);
+      }
+    }
+
+    soldier.update(dt);
+    setHud();
     renderer.render(scene, camera);
   }
   tick();
