@@ -29,8 +29,10 @@ const scene = new THREE.Scene();
 scene.fog = new THREE.Fog(0x05060a, 22, 62);
 
 const CAM_YAW    = Math.PI * 75 / 180;
-const CAM_RADIUS = 22;
-const CAM_HEIGHT = 18;
+// 35 % closer than the original 22 / 18 framing — keeps the same isometric
+// angle but pulls the character in for a more readable scale.
+const CAM_RADIUS = 14.3;
+const CAM_HEIGHT = 11.7;
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 220);
 
 window.addEventListener('resize', () => {
@@ -753,6 +755,9 @@ window.addEventListener('keydown', e => {
     d.x / len, d.z / len,
     'player',
   );
+  // Additive recoil overlay — character visibly fires regardless of
+  // whether they're standing or moving.
+  player.rig?.triggerRecoil();
   shotCooldown = SHOT_COOLDOWN;
   updateShotHUD();
 });
@@ -847,7 +852,10 @@ function animate() {
   // world.player.position sees the mecha (no stale waypoint in the corridor
   // where the player got in).
   if (!possessedMecha) {
-    player.update(dt, map, doorBlocksPlayer, battleMode);
+    // shotReady gates the rig's battle (standing aim) pose — while
+    // reloading, the body drops back to the stealth bundle so the visual
+    // matches the "Shot: Xs" HUD readout.
+    player.update(dt, map, doorBlocksPlayer, battleMode, shotCooldown <= 0);
   } else {
     player.mesh.position.x = possessedMecha.mesh.position.x;
     player.mesh.position.z = possessedMecha.mesh.position.z;

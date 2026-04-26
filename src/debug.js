@@ -6,13 +6,30 @@ export class DebugSystem {
   constructor(scene) {
     this.scene   = scene;
     this.enabled = false;
+    // Routes are now a SUB-toggle inside debug mode — TAB shows/hides the
+    // debug HUD, P additionally shows/hides the route gizmos. Defaults to
+    // off so opening debug doesn't immediately flood the floor with lines.
+    this.routesEnabled = false;
     this.objects = []; // route lines + markers
     this.overlay = this._makeOverlay();
 
     window.addEventListener('keydown', e => {
       if (window.__nanoDebugLevel) return;
       if (e.key === 'Tab') { e.preventDefault(); this.toggle(); }
+      // P only toggles when debug mode is on; pressing it outside debug is
+      // a no-op (still updates the flag so re-entering debug retains it).
+      if (e.key.toLowerCase() === 'p') {
+        this.routesEnabled = !this.routesEnabled;
+        this._applyRouteVisibility();
+      }
     });
+  }
+
+  // Single source of truth for which gizmos are actually visible. Routes
+  // need BOTH debug mode and the routes sub-toggle to be on.
+  _applyRouteVisibility() {
+    const show = this.enabled && this.routesEnabled;
+    for (const o of this.objects) o.visible = show;
   }
 
   _makeOverlay() {
@@ -32,7 +49,7 @@ export class DebugSystem {
   toggle() {
     this.enabled = !this.enabled;
     this.overlay.style.display = this.enabled ? 'block' : 'none';
-    for (const o of this.objects) o.visible = this.enabled;
+    this._applyRouteVisibility();
   }
 
   buildRoutes(enemies) {
@@ -43,6 +60,7 @@ export class DebugSystem {
     }
     this.objects = [];
 
+    const showInitial = this.enabled && this.routesEnabled;
     enemies.forEach((e, i) => {
       if (!e.routePath?.length) return;
       const col = ROUTE_COLORS[i % ROUTE_COLORS.length];
@@ -54,7 +72,7 @@ export class DebugSystem {
       const line = new THREE.Line(lineGeo,
         new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.65 })
       );
-      line.visible = this.enabled;
+      line.visible = showInitial;
       this.scene.add(line);
       this.objects.push(line);
 
@@ -65,7 +83,7 @@ export class DebugSystem {
           new THREE.MeshBasicMaterial({ color: col })
         );
         disc.position.set(pt.x, 0.12, pt.z);
-        disc.visible = this.enabled;
+        disc.visible = showInitial;
         this.scene.add(disc);
         this.objects.push(disc);
 
@@ -75,7 +93,7 @@ export class DebugSystem {
           new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.55 })
         );
         pin.position.set(pt.x, 0.7, pt.z);
-        pin.visible = this.enabled;
+        pin.visible = showInitial;
         this.scene.add(pin);
         this.objects.push(pin);
       });
@@ -108,8 +126,9 @@ export class DebugSystem {
     });
 
     // Build HTML (no actual ANSI in browser)
+    const routesLabel = this.routesEnabled ? 'ON' : 'off';
     this.overlay.innerHTML =
-      `<span style="color:#0ff;font-weight:bold">\u25a0 DEBUG</span>  <span style="opacity:.5;font-size:10px">[TAB to hide]</span>\n` +
+      `<span style="color:#0ff;font-weight:bold">\u25a0 DEBUG</span>  <span style="opacity:.5;font-size:10px">[TAB to hide \u2022 P routes: ${routesLabel}]</span>\n` +
       `Player  <b>${p.x.toFixed(1)}, ${p.z.toFixed(1)}</b>\n` +
       `Mode    <b style="color:${modeCol}">${battleMode ? 'BATTLE' : 'STEALTH'}</b>\n\n` +
       enemies.map((e, i) => {

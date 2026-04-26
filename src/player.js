@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { isWall } from './map.js';
+import { CharacterRig } from './character-rig.js';
 
 // Must match the camera yaw in main.js so WASD feels screen-aligned.
 const CAM_YAW = Math.PI * 75 / 180;
@@ -12,12 +13,19 @@ const AUTO_ALIGN_SPEED = 0.6; // rad/s
 
 export class Player {
   constructor(scene, x, z) {
-    const geo = new THREE.CapsuleGeometry(0.28, 0.4, 4, 8);
-    const mat = new THREE.MeshStandardMaterial({ color: 0x22ffcc, emissive: 0x0a3a33 });
-    this.mesh = new THREE.Mesh(geo, mat);
-    this.mesh.position.set(x, 0.55, z);
+    // CharacterRig owns the visible body, the AnimationMixer, and the blend
+    // tree that picks animations. Its root Group is added to `scene`
+    // immediately (empty) and the FBX content streams in over a few seconds —
+    // by the time the corp logo finishes, it's loaded.
+    //
+    // We alias `this.mesh` to rig.root so existing code that touches
+    // this.mesh.position / .visible (collision, mecha possession, etc.)
+    // keeps working without changes.
+    this.rig = new CharacterRig(scene, { moveSpeed: 4.5 });
+    this.rig.load();
+    this.rig.position = { x, z };
+    this.mesh = this.rig.root;
     this.mesh.castShadow = true;
-    scene.add(this.mesh);
 
     this.speed = 4.5;
     this.keys = new Set();
@@ -31,6 +39,7 @@ export class Player {
     this.facingDir = { x: 1, z: 0 };
     this.turnSpeed = Math.PI;                // rad/s
     this.idleTurnTime = AUTO_ALIGN_DELAY;    // start aligned-ready (no startup grace)
+    this.rig.facing = this.facing;           // sync rig orientation up front
 
     // Floor arrow showing facing direction.
     const triGeo = new THREE.BufferGeometry();
@@ -66,7 +75,7 @@ export class Player {
 
   get position() { return this.mesh.position; }
 
-  update(dt, map, doorBlocks = null, battleMode = false) {
+  update(dt, map, doorBlocks = null, battleMode = false, shotReady = true) {
     // ── Manual turning (Q/E) — works in BOTH modes. Real-time even during
     // slow-mo so aim stays responsive.
     let turn = 0;
@@ -130,7 +139,22 @@ export class Player {
 
     this.facingDir.x = Math.sin(this.facing);
     this.facingDir.z = Math.cos(this.facing);
-    this.mesh.rotation.y = this.facing;
+
+    // Push state into the rig and tick its blend tree. The rig handles its
+    // own mesh-rotation offset internally (Mixamo's -Z forward), so we just
+    // pass the logical facing.
+    //
+    // Battle stance is gated on shotReady — the standing-aim pose is only
+    // shown when the player can actually fire. While reloading, the rig
+    // falls back to the stealth (crouch) bundle as a clear visual cue that
+    // the shot UI status is matched by the body.
+    this.rig.facing     = this.facing;
+    this.rig.battleMode = battleMode && shotReady;
+    this.rig.setMovement(
+      this.movedThisFrame ? wx : 0,
+      this.movedThisFrame ? wz : 0,
+    );
+    this.rig.update(dt);
 
     // Sync arrow + aim line to the player's footing.
     const pp = this.mesh.position;
