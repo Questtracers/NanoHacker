@@ -1,33 +1,25 @@
 import * as THREE from 'three';
-import { SoldierRig } from './soldier-rig.js';
+import { MechaRig } from './mecha-rig.js';
 
-// Debug arena — soldier behaviour preview.
+// Debug arena — player-piloted Rocket Mecha preview.
 //
-// One SoldierRig is dropped onto an empty floor and walks a randomly-
-// generated polygon route, pausing briefly at each waypoint. The blend
-// tree picks idle / forward / back / left / right based on the soldier's
-// movement projected onto its facing — so corner-rounding triggers brief
-// strafe contributions automatically.
+// One MechaRig dropped onto an empty floor; the player drives it as if
+// it were possessed in the main game. WASD is camera-relative movement
+// (same swizzle as Player), Q/E rotates the body. The blend tree picks
+// idle / forward / back / strafe based on the world movement projected
+// onto the mecha's facing — so rotating mid-stride lets you watch the
+// strafe clips fade in.
 //
 // Controls:
-//   • WASD       — pan the camera (camera-relative)
-//   • TAB        — toggle soldier's normal / battle locomotion bundle
-//   • P          — toggle the route gizmos (line + waypoint markers)
-//   • T          — soldier fires the rifle (additive overlay)
-//   • H          — soldier takes a hit (variant chosen by current mode)
-//   • N          — soldier dies (one-shot, locks the rig in death pose)
+//   • WASD       — move (camera-relative)
+//   • Q / E      — rotate facing
+//   • TAB        — toggle normal / battle locomotion bundle
 
-const CAM_YAW       = Math.PI * 75 / 180;
-const CAM_RADIUS    = 12;
-const CAM_HEIGHT    = 9;
-const CAM_PAN_SPEED = 6;
-
-const SOLDIER_SPEED      = 1.6;        // m/s while walking
-const SOLDIER_TURN_RATE  = Math.PI;    // rad/s — facing chases movement direction
-const PAUSE_AT_WAYPOINT  = 1.2;        // s of idle between segments
-const ROUTE_HALF_EXTENT  = 10;         // route fits inside ±10 m around origin
-const NUM_WAYPOINTS      = 5;
-const TARGET_REACH       = 0.4;        // m — distance to consider waypoint hit
+const CAM_YAW    = Math.PI * 75 / 180;
+const CAM_RADIUS = 14;
+const CAM_HEIGHT = 11;
+const MOVE_SPEED = 2.0;          // m/s
+const TURN_SPEED = Math.PI;      // rad/s — same as Player
 
 export function runDebugLevel() {
   // Tell the main game module to stand down.
@@ -96,119 +88,134 @@ export function runDebugLevel() {
   ].join(';');
   document.body.appendChild(hud);
 
-  const hint = document.createElement('div');
-  hint.style.cssText = hud.style.cssText.replace('top:10px', 'bottom:10px');
-  hint.innerHTML =
-    '<b style="color:#0ff">Controls</b> ' +
-    'WASD pan • TAB normal/battle • P route • T fire • H hit • N die';
-  document.body.appendChild(hint);
-
-  // ── Random patrol route ────────────────────────────────────────────────
-  const waypoints = [];
-  for (let i = 0; i < NUM_WAYPOINTS; i++) {
-    waypoints.push(new THREE.Vector3(
-      (Math.random() - 0.5) * ROUTE_HALF_EXTENT * 2,
-      0,
-      (Math.random() - 0.5) * ROUTE_HALF_EXTENT * 2,
-    ));
-  }
-
-  // Route gizmos — line connecting the waypoints (looped) plus a disc + pin
-  // at each. Toggleable via TAB.
-  const gizmos = [];
-  let gizmosVisible = false;
-
-  {
-    const ROUTE_COLOR = 0x66ffaa;
-    const pts = waypoints.map((w) => new THREE.Vector3(w.x, 0.05, w.z));
-    pts.push(pts[0]); // close the loop
-    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
-    const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({
-      color: ROUTE_COLOR, transparent: true, opacity: 0.65,
-    }));
-    line.visible = gizmosVisible;
-    scene.add(line);
-    gizmos.push(line);
-
-    waypoints.forEach((w) => {
-      const disc = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.4, 0.4, 0.06, 20),
-        new THREE.MeshBasicMaterial({ color: ROUTE_COLOR }),
-      );
-      disc.position.set(w.x, 0.06, w.z);
-      disc.visible = gizmosVisible;
-      scene.add(disc);
-      gizmos.push(disc);
-
-      const pin = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.06, 0.06, 1.2, 8),
-        new THREE.MeshBasicMaterial({
-          color: ROUTE_COLOR, transparent: true, opacity: 0.55,
-        }),
-      );
-      pin.position.set(w.x, 0.7, w.z);
-      pin.visible = gizmosVisible;
-      scene.add(pin);
-      gizmos.push(pin);
-    });
-  }
-
-  function setGizmosVisible(v) {
-    gizmosVisible = v;
-    for (const g of gizmos) g.visible = v;
-  }
-
-  // ── Soldier rig (the only character in this debug arena) ──────────────
-  const soldier = new SoldierRig(scene, { moveSpeed: SOLDIER_SPEED });
-  soldier.position = waypoints[0];
-  // Aim initial facing at the next waypoint so the soldier doesn't have to
-  // spin on startup.
-  {
-    const dx = waypoints[1].x - waypoints[0].x;
-    const dz = waypoints[1].z - waypoints[0].z;
-    soldier.facing = Math.atan2(dx, dz);
-  }
-  soldier.load();
-
-  let currentWaypoint = 1;
-  let pauseTimer = 0;
+  // ── Mecha rig ──────────────────────────────────────────────────────────
+  const mecha = new MechaRig(scene, { moveSpeed: MOVE_SPEED });
+  window.__mecha = mecha;   // diagnostic hook for testing
+  mecha.position = { x: 0, z: 0 };
+  mecha.facing   = 0;
+  mecha.load();
 
   // ── Input ──────────────────────────────────────────────────────────────
   const keys = new Set();
   window.addEventListener('keydown', (e) => {
-    const k = e.key.toLowerCase();
-    const wasDown = keys.has(k);
-    keys.add(k);
+    keys.add(e.key.toLowerCase());
     if (e.key === 'Tab') {
       e.preventDefault();
-      soldier.battleMode = !soldier.battleMode;
+      mecha.battleMode = !mecha.battleMode;
     }
-    if (k === 'p' && !wasDown) setGizmosVisible(!gizmosVisible);
-    if (k === 't' && !wasDown) soldier.triggerFiring();
-    if (k === 'h' && !wasDown) soldier.triggerHit();
-    if (k === 'n' && !wasDown) soldier.triggerDeath();
+    // T / G — scrub the cannon/rocket recoil rate live (±0.1 per press).
+    // Read at fire time, so the next SPACE / R press uses the new value.
+    if (e.key === 't' || e.key === 'T') {
+      mecha.recoilRate = Math.max(0.1, mecha.recoilRate + 0.1);
+    }
+    if (e.key === 'g' || e.key === 'G') {
+      mecha.recoilRate = Math.max(0.1, mecha.recoilRate - 0.1);
+    }
+    // Y / H — scrub the recoil offset (how many frames the pump rewinds
+    // before snapping back). Step is 1 frame at 30 fps = 0.0333 s.
+    const FRAME_STEP = 1 / 30;
+    if (e.key === 'y' || e.key === 'Y') {
+      mecha.recoilOffset = mecha.recoilOffset + FRAME_STEP;
+    }
+    if (e.key === 'h' || e.key === 'H') {
+      mecha.recoilOffset = Math.max(FRAME_STEP, mecha.recoilOffset - FRAME_STEP);
+    }
+    // U / J — scrub the additive arm-overlay intensity (cannon + rocket).
+    // >1 extrapolates the additive delta past the authored pose so the aim
+    // dominates the underlying walk-arm swing.
+    if (e.key === 'u' || e.key === 'U') {
+      mecha.armIntensity = Math.min(40, mecha.armIntensity + 1);
+    }
+    if (e.key === 'j' || e.key === 'J') {
+      mecha.armIntensity = Math.max(0, mecha.armIntensity - 1);
+    }
+    // O — fire a hit reaction (additive, retriggers on every press).
+    if (e.key === 'o' || e.key === 'O') {
+      mecha.triggerHit();
+    }
+    // L — play the death one-shot. Press again to reset and retrigger.
+    if (e.key === 'l' || e.key === 'L') {
+      if (mecha.isDying) mecha.resetDeath();
+      mecha.triggerDeath();
+    }
+    // SPACE — first press: reverse-play the cannon clip into the held
+    // aim pose. Subsequent presses while held: recoil pump.
+    if (e.key === ' ' || e.code === 'Space') {
+      e.preventDefault();
+      mecha.triggerCannon();
+    }
+    // R — same mechanic as SPACE but for the rocket-arm clip (forward).
+    if (e.key === 'r' || e.key === 'R') {
+      mecha.triggerRocket();
+    }
+    // M — toggle the spine-identity sanity test. Forces spine.quaternion
+    // to identity post-mixer, regardless of cannon/rocket state. If the
+    // upper body visibly straightens when toggled on, the bone reference
+    // works. If nothing changes, the bone we found isn't the one the
+    // mixer / renderer is actually using.
+    if (e.key === 'm' || e.key === 'M') {
+      mecha.forceSpineIdentity = !mecha.forceSpineIdentity;
+    }
   });
   window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
 
-  // Camera target — WASD pans this; the camera follows at fixed offset.
-  const camTarget = new THREE.Vector3(
-    waypoints[0].x, 0.5, waypoints[0].z,
-  );
+  // Driver state — mirrors the player-possessed-mecha control flow from
+  // the main game.
+  const charPos = new THREE.Vector3(0, 0, 0);
+  let   facing  = 0;
+
+  // Renders the post-mixer Spine counter-rotation diagnostics. Lets us
+  // verify (1) bones got captured, (2) the held-pose target was snapshot,
+  // (3) armBlend ramps to 1, and (4) the per-frame block is actually
+  // changing spine.quaternion (adjustDeg > 0). If hipsWorldDeg moves but
+  // adjustDeg stays 0, something earlier in the chain is broken; if both
+  // are non-zero but you still see arm drift, the lock is misaiming.
+  function diagBlock(d, forceMode) {
+    if (!d) return '<br><b style="color:#f66">DIAG: no diagnostics object on rig</b>';
+    const yes = (b) => b ? '<b style="color:#0f8">yes</b>' : '<b style="color:#f66">NO</b>';
+    const heat = (deg) => {
+      if (deg < 0.05) return '#566';
+      if (deg < 1)   return '#fc4';
+      return '#0f8';
+    };
+    return '<br><span style="color:#888">— spine anchor —</span>' +
+      `<br>frame#: <b style="color:#cfe">${d.frame}</b>` +
+      ` &nbsp; force-id (M): <b style="color:${forceMode ? '#f44' : '#566'}">${forceMode ? 'ON' : 'off'}</b>` +
+      `<br>hips: <b style="color:#cfe">${d.hipsName || '<not found>'}</b>` +
+      `<br>spine: <b style="color:#cfe">${d.spineName || '<not found>'}</b>` +
+      ` <span style="color:#789">(parent: ${d.spineParent || '?'})</span>` +
+      `<br>target captured: ${yes(d.targetCaptured)}` +
+      ` &nbsp; armBlend: <b>${d.armBlend.toFixed(3)}</b>` +
+      `<br>compensated this frame: ${yes(d.compensated)}` +
+      `<br>adjust: <b style="color:${heat(d.adjustDeg)}">${d.adjustDeg.toFixed(2)}°</b>` +
+      ` &nbsp; hipsWorld: <b style="color:${heat(d.hipsWorldDeg)}">${d.hipsWorldDeg.toFixed(1)}°</b>`;
+  }
 
   function setHud() {
-    const ready = soldier.loaded;
-    const mode = soldier.battleMode ? 'BATTLE' : 'NORMAL';
-    const modeColor = soldier.battleMode ? '#f88' : '#7ef';
+    const ready = mecha.loaded;
+    const facingDeg = ((facing * 180 / Math.PI) % 360 + 360) % 360;
+    const mode = mecha.battleMode ? 'BATTLE' : 'NORMAL';
+    const modeColor = mecha.battleMode ? '#f88' : '#7ef';
     hud.innerHTML =
-      '<b style="color:#0ff">DEBUG LEVEL — soldier preview</b><br>' +
-      `loaded: <b>${(soldier.loadProgress * 100).toFixed(0)}%</b>` +
+      '<b style="color:#0ff">DEBUG LEVEL — possessed mecha</b> <span style="color:#f4a">[build:spine-diag-v2]</span><br>' +
+      `loaded: <b>${(mecha.loadProgress * 100).toFixed(0)}%</b>` +
       (ready ? '' : ' …') + '<br>' +
-      `mode: <b style="color:${modeColor}">${mode}</b><br>` +
-      `waypoint: <b>${currentWaypoint + 1} / ${waypoints.length}</b>` +
-      (pauseTimer > 0
-        ? ` <span style="opacity:.7">(idle ${pauseTimer.toFixed(1)} s)</span>`
-        : '') + '<br>' +
-      `routes: <b>${gizmosVisible ? 'ON' : 'off'}</b>`;
+      `mode:   <b style="color:${modeColor}">${mode}</b><br>` +
+      `pos:    <b>${charPos.x.toFixed(1)}, ${charPos.z.toFixed(1)}</b><br>` +
+      `facing: <b>${facingDeg.toFixed(0)}°</b><br>` +
+      `recoilRate (T/G): <b style="color:#ff0">${mecha.recoilRate.toFixed(2)}</b>` +
+      ` &nbsp; recoilFrames (Y/H): <b style="color:#ff0">${(mecha.recoilOffset * 30).toFixed(1)}f</b>` +
+      ` <span style="color:#789">(${mecha.recoilOffset.toFixed(3)}s)</span><br>` +
+      `armIntensity (U/J): <b style="color:#ff0">${mecha.armIntensity.toFixed(2)}</b><br>` +
+      `hit (O): <b style="color:${mecha.isHit ? '#fa0' : '#566'}">${mecha.isHit ? 'PLAYING' : 'idle'}</b>` +
+      ` &nbsp; death (L): <b style="color:${mecha.isDying ? '#f44' : '#566'}">${mecha.isDying ? 'DEAD' : 'alive'}</b><br>` +
+      `cannon (SPACE): <b style="color:${
+        mecha.isCannoning ? (mecha.isCannonHeld ? '#0f8' : '#fc4') : '#566'
+      }">${mecha.isCannoning ? (mecha.isCannonHeld ? 'AIMED' : 'RAISING') : 'down'}</b><br>` +
+      `rocket (R): <b style="color:${
+        mecha.isRocketing ? (mecha.isRocketHeld ? '#0f8' : '#fc4') : '#566'
+      }">${mecha.isRocketing ? (mecha.isRocketHeld ? 'ARMED' : 'ARMING') : 'down'}</b>` +
+      diagBlock(mecha.diagnostics, mecha.forceSpineIdentity);
   }
 
   // ── Update / render loop ───────────────────────────────────────────────
@@ -217,71 +224,46 @@ export function runDebugLevel() {
     requestAnimationFrame(tick);
     const dt = Math.min(clock.getDelta(), 0.05);
 
-    // Camera pan via WASD (camera-relative — same swizzle the player uses
-    // in the main game so screen-up = world -X).
+    // ── Q/E rotation ─────────────────────────────────────────────────
+    let turn = 0;
+    if (keys.has('q')) turn += 1;     // matches Player: Q = screen-left turn
+    if (keys.has('e')) turn -= 1;     //                  E = screen-right turn
+    if (turn) {
+      facing += turn * TURN_SPEED * dt;
+      while (facing >  Math.PI) facing -= Math.PI * 2;
+      while (facing < -Math.PI) facing += Math.PI * 2;
+    }
+
+    // ── WASD camera-relative movement ───────────────────────────────
     let ix = 0, iz = 0;
     if (keys.has('w')) iz -= 1;
     if (keys.has('s')) iz += 1;
     if (keys.has('a')) ix -= 1;
     if (keys.has('d')) ix += 1;
     const len = Math.hypot(ix, iz);
+    let wx = 0, wz = 0;
     if (len > 0) {
       ix /= len; iz /= len;
-      camTarget.x += iz * CAM_PAN_SPEED * dt;
-      camTarget.z += -ix * CAM_PAN_SPEED * dt;
+      wx =  iz;
+      wz = -ix;
+      charPos.x += wx * MOVE_SPEED * dt;
+      charPos.z += wz * MOVE_SPEED * dt;
     }
 
-    // Camera follows target.
+    // Push state into the rig.
+    mecha.position = charPos;
+    mecha.facing   = facing;
+    mecha.setMovement(len > 0 ? wx : 0, len > 0 ? wz : 0);
+    mecha.update(dt);
+
+    // ── Camera follow ────────────────────────────────────────────────
     camera.position.set(
-      camTarget.x + Math.sin(CAM_YAW) * CAM_RADIUS,
+      charPos.x + Math.sin(CAM_YAW) * CAM_RADIUS,
       CAM_HEIGHT,
-      camTarget.z + Math.cos(CAM_YAW) * CAM_RADIUS,
+      charPos.z + Math.cos(CAM_YAW) * CAM_RADIUS,
     );
-    camera.lookAt(camTarget.x, 0.5, camTarget.z);
+    camera.lookAt(charPos.x, 1.0, charPos.z);
 
-    // ── Soldier route follower ───────────────────────────────────────
-    if (soldier.isDying) {
-      soldier.setMovement(0, 0);
-    } else if (pauseTimer > 0) {
-      pauseTimer -= dt;
-      soldier.setMovement(0, 0);
-    } else if (soldier.loaded) {
-      const target = waypoints[currentWaypoint];
-      const pos    = soldier.position;
-      const dx     = target.x - pos.x;
-      const dz     = target.z - pos.z;
-      const dist   = Math.hypot(dx, dz);
-      if (dist < TARGET_REACH) {
-        // Reached waypoint — pause briefly then advance to the next.
-        pauseTimer = PAUSE_AT_WAYPOINT;
-        currentWaypoint = (currentWaypoint + 1) % waypoints.length;
-        soldier.setMovement(0, 0);
-      } else {
-        // Step toward the waypoint at SOLDIER_SPEED.
-        const dirX = dx / dist;
-        const dirZ = dz / dist;
-        pos.x += dirX * SOLDIER_SPEED * dt;
-        pos.z += dirZ * SOLDIER_SPEED * dt;
-
-        // Smoothly turn the soldier's facing toward the movement direction.
-        // While the rotation lags the movement, the blend tree picks up
-        // the strafe components automatically (forward + a touch of left
-        // or right).
-        const targetFacing = Math.atan2(dirX, dirZ);
-        let diff = targetFacing - soldier.facing;
-        while (diff >  Math.PI) diff -= Math.PI * 2;
-        while (diff < -Math.PI) diff += Math.PI * 2;
-        const turnStep = Math.sign(diff) *
-                         Math.min(Math.abs(diff), SOLDIER_TURN_RATE * dt);
-        soldier.facing = soldier.facing + turnStep;
-
-        // Tell the rig the world-space movement direction so its blend
-        // tree can resolve forward / back / left / right.
-        soldier.setMovement(dirX, dirZ);
-      }
-    }
-
-    soldier.update(dt);
     setHud();
     renderer.render(scene, camera);
   }

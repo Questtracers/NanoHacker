@@ -152,26 +152,28 @@ export class SoldierRig {
 
   get isDying() { return this._dying; }
 
-  // Brief shooting overlay — additive, plays on top of locomotion. Returns
-  // false if already firing, dying, or the clip isn't loaded yet.
+  // Brief shooting overlay — additive, plays on top of locomotion. Every
+  // call restarts the clip even if a previous firing is still mid-play,
+  // so a burst-fire soldier animates each individual shot. Suppressed
+  // only by death.
   triggerFiring() {
-    if (this._firing || this._dying) return false;
+    if (this._dying) return false;
     const a = this._actions.firing;
     if (!a) return false;
     this._firing = true;
     a.setLoop(THREE.LoopOnce, 1);
     a.clampWhenFinished = true;
-    a.reset();
-    a.setEffectiveWeight(0);
+    a.reset();                          // restart from frame 0 every shot
+    a.setEffectiveWeight(0);            // firingBlend ramps to 1
     a.play();
     return true;
   }
 
   // Hit reaction — additive overlay. Picks the variant that matches the
-  // soldier's current locomotion bundle (battle vs normal), so the
-  // reaction blends correctly with the underlying body state.
+  // soldier's current bundle (battle vs normal). Re-triggers on every
+  // call so back-to-back damage events each get a flinch.
   triggerHit() {
-    if (this._hitting || this._dying) return false;
+    if (this._dying) return false;
     const slot = this._battle ? 'hitBattle' : 'hitNormal';
     const a = this._actions[slot];
     if (!a) return false;
@@ -179,7 +181,7 @@ export class SoldierRig {
     this._hitSlot = slot;
     a.setLoop(THREE.LoopOnce, 1);
     a.clampWhenFinished = true;
-    a.reset();
+    a.reset();                          // restart from frame 0 every hit
     a.setEffectiveWeight(0);
     a.play();
     return true;

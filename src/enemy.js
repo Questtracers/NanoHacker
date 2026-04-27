@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { isWall, rayMarch, findPath, findValidFloor } from './map.js';
 import { makeFacingArrow } from './facing-arrow.js';
+import { SoldierRig } from './soldier-rig.js';
 
 const STEALTH_CONE_ANGLE = Math.PI / 4;
 const STEALTH_CONE_RANGE = 7;
@@ -16,14 +17,18 @@ const AIM_SAMPLE_INTERVAL = 0.45; // s of real time between aim re-locks
 
 export class Enemy {
   constructor(scene, x, z) {
-    const body = new THREE.Mesh(
-      new THREE.CapsuleGeometry(0.28, 0.4, 4, 8),
-      new THREE.MeshStandardMaterial({ color: 0xff5555, emissive: 0x331010 })
-    );
-    body.position.set(x, 0.55, z);
-    body.castShadow = true;
-    scene.add(body);
-    this.mesh = body;
+    // SoldierRig replaces the placeholder capsule. The rig's root Group
+    // is added to the scene immediately and the FBX content streams in
+    // over a few seconds — by the time the corp logo finishes the body
+    // is visible.
+    //
+    // We alias `this.mesh` to rig.root so existing AI code (collision,
+    // cone math, HP bar positioning, etc.) keeps reading position from
+    // the same place.
+    this.rig = new SoldierRig(scene, { moveSpeed: 2.0 });
+    this.rig.position = { x, z };
+    this.rig.load();
+    this.mesh = this.rig.root;
 
     this.coneSegments = 28;
     const coneGeo = new THREE.BufferGeometry();
@@ -49,6 +54,7 @@ export class Enemy {
 
     this.facing          = Math.random() * Math.PI * 2;
     this.targetFacing    = this.facing;
+    this.rig.facing      = this.facing;
     // During a short window after a bullet grazes us the cone swings at a
     // FAST rate toward the bullet's source regardless of anything else the
     // AI wants to track — this keeps the reaction feeling sudden.
@@ -301,7 +307,12 @@ export class Enemy {
   }
 
   update(dt, map, world, game) {
-    if (!this.alive) return;
+    if (!this.alive) {
+      // Even a dead soldier needs the mixer to advance so the death clip
+      // plays through and stays clamped at its final pose.
+      if (this.rig) this.rig.update(dt);
+      return;
+    }
     // Back-compat: if the host still passes the player directly, wrap it.
     if (world && !world.player && world.position) world = { player: world };
 
@@ -309,6 +320,11 @@ export class Enemy {
     // wind-up during slow-mo. Movement still uses dt (worldDt) to honour the
     // SUPERHOT bargain.
     const realDt = world?.realDt ?? dt;
+
+    // Capture the body position before AI moves it — the delta this frame
+    // is what the rig's blend tree uses to pick locomotion clips.
+    const beforeX = this.mesh.position.x;
+    const beforeZ = this.mesh.position.z;
 
     const target = this._findVisibleTarget(world, map);
     const seesTarget = target !== null;
@@ -363,6 +379,7 @@ export class Enemy {
         const fx = Math.sin(this.facing);
         const fz = Math.cos(this.facing);
         game.spawnBullet(this.mesh.position.x, this.mesh.position.z, fx, fz, owner, this);
+        if (this.rig) this.rig.triggerFiring();
         this.burstRemaining--;
         if (this.burstRemaining <= 0) {
           this.burstRemaining = 3;
@@ -451,6 +468,25 @@ export class Enemy {
     this.facingArrow.position.set(fp.x, 0.04, fp.z);
     this.facingArrow.rotation.y = this.facing;
     this.facingArrow.visible    = this.alive;
+
+    // ── Push state into the SoldierRig ─────────────────────────────────
+    // The blend tree picks idle / strafe directions from the actual world
+    // movement that happened during this AI tick. We feed it the delta
+    // between pre-AI and current positions; the rig normalises and projects
+    // onto its own facing internally. battleMode mirrors `alerted`.
+    if (this.rig) {
+      const moveDx = this.mesh.position.x - beforeX;
+      const moveDz = this.mesh.position.z - beforeZ;
+      const len    = Math.hypot(moveDx, moveDz);
+      this.rig.facing     = this.facing;
+      this.rig.battleMode = this.alerted;
+      if (len > 1e-5) {
+        this.rig.setMovement(moveDx / len, moveDz / len);
+      } else {
+        this.rig.setMovement(0, 0);
+      }
+      this.rig.update(dt);
+    }
   }
 
   // Chase a moving target via a periodically-recomputed BFS path. Falls back
@@ -545,6 +581,9 @@ export class Enemy {
     this.hpTimer = 3;
     this.hpBarBg.visible = true;
     this.hpBarFg.visible = true;
+    // Visual flinch — the rig picks the variant that matches its current
+    // mode (battle ⇒ aggressive hit, otherwise normal hit).
+    if (this.rig && this.hp > 0) this.rig.triggerHit();
     if (this.hp <= 0) this.kill();
   }
 
@@ -571,9 +610,19 @@ export class Enemy {
     this.hpTimer = 5;
     this.hpBarBg.visible = true;
     this.hpBarFg.visible = true;
-    if (this.mesh?.material) {
-      this.mesh.material.color.setHex(0x66ccff);
-      if (this.mesh.material.emissive) this.mesh.material.emissive.setHex(0x113355);
+    // Tint every SkinnedMesh material under the rig with a friendly blue
+    // emissive glow — keeps the authored texture but adds a clear visual
+    // cue. The old capsule had a single top-level material; the rig
+    // hierarchy may have several, so traverse.
+    if (this.mesh) {
+      this.mesh.traverse((c) => {
+        if (!c.isMesh && !c.isSkinnedMesh) return;
+        const tint = (m) => {
+          if (m.emissive) m.emissive.setHex(0x113355);
+        };
+        if (Array.isArray(c.material)) c.material.forEach(tint);
+        else if (c.material)            tint(c.material);
+      });
     }
     this.alerted          = false;
     this.losingSightTimer = 0;
@@ -584,7 +633,10 @@ export class Enemy {
 
   kill() {
     this.alive               = false;
-    this.mesh.visible        = false;
+    // Don't hide the body — let the death animation play and clamp at the
+    // final pose. The rig's mixer keeps ticking via the early-return path
+    // in update() so the clip plays through.
+    if (this.rig) this.rig.triggerDeath();
     this.coneMesh.visible    = false;
     this.facingArrow.visible = false;
     this.hpBarBg.visible     = false;
