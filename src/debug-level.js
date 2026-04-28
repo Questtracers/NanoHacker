@@ -1,7 +1,6 @@
 import * as THREE from 'three';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { Player } from './player.js';
-import { Mecha }  from './mecha.js';
-import { Drone }  from './drone.js';
 import { Bullet } from './bullet.js';
 import { Rocket } from './rocket.js';
 
@@ -133,25 +132,60 @@ export function runDebugLevel() {
     }
   }
 
+  // ── Drone rotation tuner ──────────────────────────────────────────────
+  // A static Drone.fbx hovering at a fixed point — no AI, no movement,
+  // no shots. The user adjusts its X / Y rotation live with U/J/H/L
+  // and reads the values off the HUD; we use the result to bake the
+  // correct PRE_ROT values into the gameplay Drone class.
+  const tuner = {
+    droneRotX: 0,
+    droneRotY: 0,
+    droneRoot: null,            // Group we apply rotations to
+    apply() {
+      if (!this.droneRoot) return;
+      this.droneRoot.rotation.set(this.droneRotX, this.droneRotY, 0);
+    },
+  };
+  (async () => {
+    const loader = new FBXLoader();
+    const fbx = await loader.loadAsync('Assets/Drone/Drone.fbx');
+    // Auto-scale to ~0.7 m so it reads at a recognisable drone size.
+    const box = new THREE.Box3().setFromObject(fbx);
+    const size = box.getSize(new THREE.Vector3());
+    const native = Math.max(size.x, size.y, size.z) || 1;
+    const scale = 0.7 / native;
+    fbx.scale.setScalar(scale);
+    box.setFromObject(fbx);
+    const center = box.getCenter(new THREE.Vector3());
+    fbx.position.sub(center);
+    fbx.traverse((c) => {
+      if (!c.isMesh && !c.isSkinnedMesh) return;
+      c.castShadow    = true;
+      c.receiveShadow = true;
+    });
+    // Wrap in a Group so rotation is applied cleanly without fighting
+    // any baked-in transform on the FBX root.
+    const root = new THREE.Group();
+    root.position.set(ARENA_HALF + 6, 1.5, ARENA_HALF);  // hovering
+    root.add(fbx);
+    scene.add(root);
+    tuner.droneRoot = root;
+    tuner.apply();
+  })();
+
   // ── Player ─────────────────────────────────────────────────────────────
   const playerStart = { x: ARENA_HALF - 6, z: ARENA_HALF };
   const player = new Player(scene, playerStart.x, playerStart.z);
   player.hp = PLAYER_MAX_HP;
   let playerHp = PLAYER_MAX_HP;
 
-  // ── Mecha ──────────────────────────────────────────────────────────────
-  const mechaStart = { x: ARENA_HALF + 6, z: ARENA_HALF };
-  const mecha = new Mecha(scene, mechaStart.x, mechaStart.z);
-
-  // ── Drone ──────────────────────────────────────────────────────────────
-  // One drone wandering the opposite side so the visual upgrades (FBX
-  // model, body yaw, pitch banking, recoil offset) can be observed.
-  const droneStart = { x: ARENA_HALF - 8, z: ARENA_HALF + 4 };
-  const drones = [new Drone(scene, droneStart.x, droneStart.z, null)];
+  // Mecha + drone are removed so the focus is purely on the wall /
+  // door tuner corridor. Re-add them here when you want to fight or
+  // test possession again.
 
   // Diagnostic hook for in-page testing.
   window.__nanoSandbox = {
-    player, mecha, drones, scene,
+    player, scene, tuner,
     get bullets() { return bullets; },
   };
 
@@ -160,8 +194,8 @@ export function runDebugLevel() {
   const world = {
     player,
     enemies: [],
-    drones,
-    mechas:  [mecha],
+    drones:  [],
+    mechas:  [],
     realDt: 0,
     cameraYaw: CAM_YAW,
     destroyObstacleAt() { /* obstacles are static in the sandbox */ },
@@ -192,28 +226,14 @@ export function runDebugLevel() {
   document.body.appendChild(hud);
 
   // ── Extra debug input ─────────────────────────────────────────────────
-  // Player.constructor wires WASD/Q/E itself. We only listen for our
-  // sandbox-specific shortcuts on top.
-  let battleMode = false;
+  // Player.constructor wires WASD/Q/E itself. We only listen for the
+  // sandbox-specific shortcuts (SPACE shoot + tile-tuner keys) here.
   let shotCooldown = 0;
-  let slowMoActive = false;        // for HUD readout
   const SHOT_COOLDOWN = 0.6;
   window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
-    if (k === 'tab') {
-      e.preventDefault();
-      // Manually flip alert state for testing (also triggers battle mode).
-      mecha.alerted = !mecha.alerted;
-      if (mecha.alerted) mecha.aimedPos = { x: player.position.x, z: player.position.z };
-    }
     if (k === ' ' || e.code === 'Space') {
       e.preventDefault();
-      // Player fan / pistol shot — single bullet if not possessed, else
-      // hand off to the mecha's possessed fire path.
-      if (mecha.possessed) {
-        mecha.playerFire(game);
-        return;
-      }
       if (shotCooldown > 0) return;
       const d = player.facingDir;
       const len = Math.hypot(d.x, d.z) || 1;
@@ -224,70 +244,21 @@ export function runDebugLevel() {
       );
       shotCooldown = SHOT_COOLDOWN;
     }
-    if (k === 'f') {
-      if (mecha.possessed) mecha.playerFireRocket(game);
-    }
-    if (k === 'h') {
-      if (mecha.alive && mecha.faction !== 'friendly') mecha.hackLink();
-    }
-    if (k === 'p') {
-      if (mecha.possessed) {
-        mecha.leavePossession();
-        player.mesh.visible = true;
-        player.facingTri.visible = true;
-      } else if (mecha.alive && mecha.faction === 'friendly') {
-        mecha.enterPossession();
-        player.mesh.position.x = mecha.mesh.position.x;
-        player.mesh.position.z = mecha.mesh.position.z;
-        player.mesh.visible = false;
-        player.facingTri.visible = false;
-      }
-    }
+    // ── Drone rotation tuner ────────────────────────────────────────
+    // U / J = X axis, H / L = Y axis. Step is 15°.
+    const TUNE_STEP = Math.PI / 12;
+    if (k === 'u') { tuner.droneRotX += TUNE_STEP; tuner.apply(); }
+    if (k === 'j') { tuner.droneRotX -= TUNE_STEP; tuner.apply(); }
+    if (k === 'h') { tuner.droneRotY += TUNE_STEP; tuner.apply(); }
+    if (k === 'l') { tuner.droneRotY -= TUNE_STEP; tuner.apply(); }
   });
 
-  // Bullet collision against player + mecha. Player gets damaged by
-  // 'enemy' bullets (mecha's regular fire), mecha gets hit by 'player'
-  // bullets. Friendly fire is on for everything else.
+  // Bullet collision — only walls (handled in Bullet.update) since the
+  // mecha + drone are gone. Bullets just expire on hit / lifetime.
   function tickBullets(dt) {
     for (const b of bullets) {
       if (!b.alive) continue;
       b.update(dt, map, player, [], game);
-      if (!b.alive) continue;
-      // Player hit
-      if (b.owner === 'enemy' && !mecha.possessed) {
-        const dx = b.mesh.position.x - player.position.x;
-        const dz = b.mesh.position.z - player.position.z;
-        if (dx * dx + dz * dz < 0.7) {
-          playerHp = Math.max(0, playerHp - (b.damage || 1));
-          b.destroy();
-          continue;
-        }
-      }
-      // Mecha hit
-      if (b.owner === 'player' && b.shooter !== mecha) {
-        const dx = b.mesh.position.x - mecha.mesh.position.x;
-        const dz = b.mesh.position.z - mecha.mesh.position.z;
-        const r = mecha.hitRadius || 1;
-        if (dx * dx + dz * dz < r * r) {
-          mecha.takeDamage(b.damage || 1);
-          b.destroy();
-          continue;
-        }
-      }
-      // Drone hits — player shots damage hostile drones; the drone's own
-      // shots damage the player (handled above via owner==='enemy').
-      if (b.owner === 'player') {
-        for (const d of drones) {
-          if (!d.alive || d.faction !== 'hostile' || b.shooter === d) continue;
-          const dx = b.mesh.position.x - d.mesh.position.x;
-          const dz = b.mesh.position.z - d.mesh.position.z;
-          if (dx * dx + dz * dz < 0.45 * 0.45) {
-            d.takeDamage(b.damage || 1);
-            b.destroy();
-            break;
-          }
-        }
-      }
     }
     for (let i = bullets.length - 1; i >= 0; i--) {
       if (!bullets[i].alive) bullets.splice(i, 1);
@@ -295,37 +266,14 @@ export function runDebugLevel() {
   }
 
   function setHud() {
-    const possessed = mecha.possessed ? 'POSSESSED' : (mecha.faction === 'friendly' ? 'FRIENDLY' : 'HOSTILE');
-    const possessedColor = mecha.possessed ? '#0f8'
-                         : (mecha.faction === 'friendly' ? '#7ef' : '#f88');
-    const armState = mecha.rig?.isCannonHeld ? 'CANNON HELD'
-                   : mecha.rig?.isCannoning   ? 'CANNON RAISING'
-                   : mecha.rig?.isRocketHeld  ? 'ROCKET HELD'
-                   : mecha.rig?.isRocketing   ? 'ROCKET ARMING'
-                   : mecha.rig?._disarming    ? 'DISARMING ' + mecha.rig._disarming.toUpperCase()
-                   : 'DOWN';
-    const armColor = (mecha.rig?.isCannonHeld || mecha.rig?.isRocketHeld) ? '#0f8'
-                   : (mecha.rig?._disarming) ? '#fa0'
-                   : (mecha.rig?.isCannoning || mecha.rig?.isRocketing) ? '#fc4'
-                   : '#566';
+    const r2d = (r) => (r * 180 / Math.PI).toFixed(0);
     hud.innerHTML =
-      '<b style="color:#0ff">DEBUG LEVEL — gameplay sandbox</b><br>' +
+      '<b style="color:#0ff">DEBUG LEVEL — drone rotation tuner</b><br>' +
       'WASD move • Q/E turn • SPACE shoot<br>' +
-      'TAB alert • H hack • P possess • F rocket(possessed)<br>' +
-      `mode: <b style="color:${battleMode ? '#f88' : '#7ef'}">${battleMode ? 'BATTLE' : 'STEALTH'}</b>` +
-      ` &nbsp; slow-mo: <b style="color:${slowMoActive ? '#fc4' : '#566'}">${slowMoActive ? 'ON (8%)' : 'off'}</b><br>` +
-      '<br>' +
-      `Player HP: <b style="color:${playerHp <= 0 ? '#f44' : '#cfe'}">${playerHp} / ${PLAYER_MAX_HP}</b><br>` +
-      `Mecha HP:  <b>${mecha.hp} / ${mecha.maxHp}</b> ` +
-      `<span style="color:${possessedColor}">[${possessed}]</span><br>` +
-      `alerted: <b style="color:${mecha.alerted ? '#f88' : '#7ef'}">${mecha.alerted ? 'YES' : 'no'}</b>` +
-      ` &nbsp; loseSightT: <b>${(mecha.losingSightTimer || 0).toFixed(1)}s</b><br>` +
-      `arm state: <b style="color:${armColor}">${armState}</b><br>` +
-      `shootCD: <b>${Math.max(0, mecha.shootCooldown).toFixed(1)}s</b>` +
-      ` &nbsp; rocketCD: <b>${Math.max(0, mecha.rocketCooldown).toFixed(1)}s</b>` +
-      (mecha.possessed
-        ? `<br>disarmTimer: <b>${Math.max(0, mecha._disarmTimer || 0).toFixed(1)}s</b>`
-        : '');
+      '<span style="color:#aaa">drone — U/J = X axis • H/L = Y axis</span><br>' +
+      `drone rot: <b style="color:#ff0">x=${r2d(tuner.droneRotX)}°</b> ` +
+      `<b style="color:#ff0">y=${r2d(tuner.droneRotY)}°</b><br>` +
+      `Player HP: <b style="color:${playerHp <= 0 ? '#f44' : '#cfe'}">${playerHp} / ${PLAYER_MAX_HP}</b>`;
   }
 
   // ── Update / render loop ───────────────────────────────────────────────
@@ -336,54 +284,21 @@ export function runDebugLevel() {
     world.realDt = dt;
 
     if (shotCooldown > 0) shotCooldown -= dt;
-
-    // ── Player update first so movedThisFrame is fresh for slow-mo ────
-    if (mecha.possessed) {
-      // Possessed: mecha reads player.keys and drives itself.
-      // Keep the player ghost glued to the mecha so anything looking up
-      // world.player.position sees the mecha's spot.
-      player.mesh.position.x = mecha.mesh.position.x;
-      player.mesh.position.z = mecha.mesh.position.z;
-    } else {
-      player.update(dt, map, null, battleMode, shotCooldown <= 0);
-    }
-
-    // ── SUPERHOT slow-mo ─────────────────────────────────────────────
-    // Same rule as main.js: while battle mode is active AND the player
-    // isn't moving, the world ticks at 8% speed. Possessed-mecha mode
-    // counts WASD-on-mecha as "moving" so the slow-mo lifts whenever
-    // the human is at the wheel and steering.
-    const ctrlMoved = mecha.possessed
-      ? ['w','a','s','d'].some(k => player.keys.has(k))
-      : player.movedThisFrame;
-    let worldDt = dt;
-    slowMoActive = battleMode && !ctrlMoved;
-    if (slowMoActive) worldDt = dt * 0.08;
-
-    mecha.update(worldDt, map, world, game);
-    for (const d of drones) d.update(worldDt, map, world, game, performance.now() / 1000);
-    tickBullets(worldDt);
-
-    battleMode =
-      (!!mecha.alerted  && mecha.faction !== 'friendly') ||
-      drones.some(d => d.alive && d.alerted && d.faction === 'hostile');
-
+    player.update(dt, map, null, false, shotCooldown <= 0);
+    tickBullets(dt);
     setHud();
 
     // ── Camera follow ────────────────────────────────────────────────
-    // Center on the midpoint between player and mecha so both are
-    // always in frame, with a slight bias toward whichever is
-    // currently being controlled.
-    const focus = mecha.possessed ? mecha.mesh.position : player.position;
-    const other = mecha.possessed ? player.position : mecha.mesh.position;
-    const cx = focus.x * 0.7 + other.x * 0.3;
-    const cz = focus.z * 0.7 + other.z * 0.3;
+    // Bias toward the drone position so the tuner stays in frame
+    // while the user iterates on rotation values.
+    const focusX = player.position.x * 0.5 + (ARENA_HALF + 6) * 0.5;
+    const focusZ = player.position.z * 0.5 + ARENA_HALF       * 0.5;
     camera.position.set(
-      cx + Math.sin(CAM_YAW) * CAM_RADIUS,
+      focusX + Math.sin(CAM_YAW) * CAM_RADIUS,
       CAM_HEIGHT,
-      cz + Math.cos(CAM_YAW) * CAM_RADIUS,
+      focusZ + Math.cos(CAM_YAW) * CAM_RADIUS,
     );
-    camera.lookAt(cx, 1.0, cz);
+    camera.lookAt(focusX, 1.0, focusZ);
 
     renderer.render(scene, camera);
   }

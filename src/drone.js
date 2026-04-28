@@ -7,13 +7,13 @@ import { makeFacingArrow } from './facing-arrow.js';
 // `facing` = cone direction (legacy, used for AI + vision).
 // `bodyFacing` = the model's yaw, follows movement / shoot direction
 //                independently of the cone. Smoothed toward target.
-// `bodyPitch`  = forward tilt scaling with cone yaw rate, so the model
-//                visibly "leans" when it's scanning fast and flattens
-//                when it holds still. Smoothed by an exp-blend term.
+// `bodyPitch`  = forward tilt that BANKS through a yaw rotation: zero
+//                at the start, peaks at the rotation midpoint, back to
+//                zero at the end. Magnitude scales with how big the
+//                rotation is, capped at BODY_PITCH_MAX.
 const BODY_TURN_SPEED      = 6.0;            // rad/s body smoothing
-const BODY_PITCH_SCALE     = 0.45;           // rad / (rad/s) cone yaw rate
-const BODY_PITCH_MAX       = Math.PI * 0.18; // cap pitch at ~32°
-const BODY_PITCH_BLEND_RATE = 6.0;           // 1/s exp blend toward target
+const BODY_PITCH_MAX       = Math.PI / 3;    // 60° peak — biggest banks
+const BODY_PITCH_BLEND_RATE = 8.0;           // 1/s exp blend toward target
 // Recoil — total duration in seconds, peak displacement in metres.
 // Curve: fast attack to peak (15 % of duration), then easing back to 0.
 const RECOIL_DURATION      = 0.5;
@@ -91,6 +91,9 @@ export class Drone {
         box.setFromObject(fbx);
         const center = box.getCenter(new THREE.Vector3());
         fbx.position.sub(center);
+        // Authored orientation has the model on its side; rotate -90°
+        // around X so the flat underside ends up parallel to the floor.
+        fbx.rotation.x = -Math.PI / 2;
         // Swap placeholder for the real model.
         this.bodyVis.remove(this._placeholder);
         this._placeholder = null;
@@ -139,6 +142,13 @@ export class Drone {
     this._lastFacing     = this.facing;
     this._lastBodyX      = x;
     this._lastBodyZ      = z;
+    // Bank-through-yaw state. When the body's yaw target shifts to a
+    // new heading we snapshot the start angle and total signed rotation;
+    // pitch then follows a sine curve that peaks at the rotation
+    // midpoint and returns to zero on arrival.
+    this._yawBankStart   = this.facing;
+    this._yawBankTarget  = this.facing;
+    this._yawBankTotal   = 0;
     // Recoil timer ticks down from RECOIL_DURATION on each shot.
     this._recoilTimer    = 0;
     this._recoilFacing   = this.facing;
@@ -507,29 +517,48 @@ export class Drone {
       const moveLen = Math.hypot(dx, dz);
       if (moveLen > 0.005) target = Math.atan2(dx, dz);
     }
+
+    // Detect a "fresh" yaw target — if the new target differs from
+    // the previous bank target by more than a small threshold, we
+    // re-snapshot start + total so pitch starts a new sine arc.
+    const wrap = (a) => {
+      while (a >  Math.PI) a -= Math.PI * 2;
+      while (a < -Math.PI) a += Math.PI * 2;
+      return a;
+    };
+    const targetDelta = wrap(target - this._yawBankTarget);
+    if (Math.abs(targetDelta) > 0.05) {
+      this._yawBankStart  = this.bodyFacing;
+      this._yawBankTarget = target;
+      this._yawBankTotal  = wrap(target - this.bodyFacing);
+    }
+
     // Smooth toward target (shortest arc).
-    let diff = target - this.bodyFacing;
-    while (diff >  Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
+    let diff = wrap(target - this.bodyFacing);
     const yawStep = Math.min(Math.abs(diff), BODY_TURN_SPEED * dt);
     this.bodyFacing += Math.sign(diff) * yawStep;
 
-    // ── Pitch from cone yaw rate ───────────────────────────────────
-    // Cone yaw delta this frame → angular speed → target pitch.
-    // Sign: pitch FORWARD (negative rotation.x in three.js convention
-    // where +Z is forward) regardless of yaw direction; we use the
-    // magnitude of the rate, not its sign, so the drone "leans" the
-    // same way left or right.
-    let conYawRate = this.facing - this._lastFacing;
-    while (conYawRate >  Math.PI) conYawRate -= Math.PI * 2;
-    while (conYawRate < -Math.PI) conYawRate += Math.PI * 2;
-    conYawRate = conYawRate / dt;                              // rad/s
-    const targetPitch = -Math.max(
-      -BODY_PITCH_MAX,
-      Math.min(BODY_PITCH_MAX, Math.abs(conYawRate) * BODY_PITCH_SCALE),
-    );
+    // ── Pitch from yaw progress (banks through the rotation) ─────
+    // Pitch follows a sine curve over the rotation: 0 at start,
+    // peak at midpoint, 0 at arrival. Peak magnitude scales with
+    // how big the rotation is — small turns barely tilt, half-circle
+    // turns bank to the full BODY_PITCH_MAX.
+    let pitchTarget = 0;
+    const totalAbs = Math.abs(this._yawBankTotal);
+    if (totalAbs > 0.05) {
+      const traveled = wrap(this.bodyFacing - this._yawBankStart);
+      const progress = Math.max(0, Math.min(1,
+        (this._yawBankTotal !== 0 ? traveled / this._yawBankTotal : 0)));
+      const magnitude = Math.min(1, totalAbs / Math.PI);
+      pitchTarget = -BODY_PITCH_MAX * magnitude * Math.sin(progress * Math.PI);
+      // Once the yaw has settled, retire the bank so we don't keep
+      // computing a stale curve.
+      if (Math.abs(diff) < 0.02 && progress >= 0.999) {
+        this._yawBankTotal = 0;
+      }
+    }
     const pitchStep = Math.min(1, dt * BODY_PITCH_BLEND_RATE);
-    this.bodyPitch += (targetPitch - this.bodyPitch) * pitchStep;
+    this.bodyPitch += (pitchTarget - this.bodyPitch) * pitchStep;
     this._lastFacing  = this.facing;
     this._lastBodyX   = this.mesh.position.x;
     this._lastBodyZ   = this.mesh.position.z;

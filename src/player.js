@@ -50,7 +50,7 @@ export class Player {
     ]), 3));
     triGeo.computeVertexNormals();
     const triMat = new THREE.MeshBasicMaterial({
-      color: 0x66ffcc, transparent: true, opacity: 0.85, side: THREE.DoubleSide,
+      color: 0x66ffcc, transparent: true, opacity: 0.25, side: THREE.DoubleSide,
     });
     this.facingTri = new THREE.Mesh(triGeo, triMat);
     this.facingTri.position.y = 0.04;
@@ -111,12 +111,17 @@ export class Player {
       const nz = p.z + wz * step;
       const blockX = doorBlocks ? doorBlocks(nx, p.z) : false;
       const blockZ = doorBlocks ? doorBlocks(p.x, nz) : false;
+      // Wider collision margin (0.55) than before (0.3): the GLB wall
+      // tiles sit on the wall-cell side of the boundary but the rig
+      // mesh is wider than the raw 0.3 buffer was assuming. 0.55
+      // keeps the rig's silhouette well clear of the wall geometry.
+      const M = 0.55;
       if (!blockX &&
-          !isWall(map, nx, p.z) && !isWall(map, nx + Math.sign(wx) * 0.3, p.z) &&
-          !isWall(map, nx, p.z + 0.3) && !isWall(map, nx, p.z - 0.3)) p.x = nx;
+          !isWall(map, nx, p.z) && !isWall(map, nx + Math.sign(wx) * M, p.z) &&
+          !isWall(map, nx, p.z + M) && !isWall(map, nx, p.z - M)) p.x = nx;
       if (!blockZ &&
-          !isWall(map, p.x, nz) && !isWall(map, p.x + 0.3, nz) &&
-          !isWall(map, p.x - 0.3, nz) && !isWall(map, p.x, nz + Math.sign(wz) * 0.3)) p.z = nz;
+          !isWall(map, p.x, nz) && !isWall(map, p.x + M, nz) &&
+          !isWall(map, p.x - M, nz) && !isWall(map, p.x, nz + Math.sign(wz) * M)) p.z = nz;
     } else {
       this.lastMoveAmount = 0;
     }

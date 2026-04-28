@@ -1,10 +1,11 @@
 import * as THREE from 'three';
 import { generateMap, buildMapMesh, pickFloorCell, findPath, findValidFloor, pickSpreadFloorCells, setRayBlocker } from './map.js';
+import { buildLevelTiles, attachDoorFrame } from './level-tiles.js';
 import { Player } from './player.js';
 import { Enemy } from './enemy.js';
 import { Drone } from './drone.js';
 import { Door } from './door.js';
-import { Obstacle } from './obstacle.js';
+import { Obstacle, updateCrateDebris } from './obstacle.js';
 import { Mecha } from './mecha.js';
 import { Bullet } from './bullet.js';
 import { Rocket } from './rocket.js';
@@ -14,6 +15,44 @@ import { showCorpLogo } from './corplogo.js';
 import { runDebugLevel } from './debug-level.js';
 
 const hudMode     = document.getElementById('mode');
+
+// Tiny always-on overlay for the tile-tweak keys (I/K Y-offset, O/L
+// wall-height scale). Sits in the top-right so it doesn't fight the
+// main HUD. Refreshed by _refreshTileTweakHud whenever a key changes
+// the values; updated in animate() too so the actual metric reads
+// stay in sync if anything else mutates the group.
+const _tileTweakHud = document.createElement('div');
+_tileTweakHud.style.cssText = [
+  'position:fixed', 'top:8px', 'right:8px', 'z-index:11',
+  'padding:6px 10px',
+  'background:rgba(0,5,15,0.7)', 'border:1px solid #0ff5',
+  'border-radius:4px', 'font-family:monospace', 'font-size:12px',
+  'color:#cfe', 'line-height:1.5', 'pointer-events:none',
+  'white-space:nowrap',
+].join(';');
+document.body.appendChild(_tileTweakHud);
+_tileTweakHud.innerHTML = '<span style="color:#789">tile tweak (waiting for load)</span>';
+function _refreshTileTweakHud() {
+  // levelTilesGroup is declared later in this file; only safe to read
+  // once buildLevelTiles' Promise has populated it.
+  const g = (typeof levelTilesGroup !== 'undefined') ? levelTilesGroup : null;
+  if (!g) {
+    _tileTweakHud.innerHTML = '<span style="color:#789">tile tweak (waiting for load)</span>';
+    return;
+  }
+  const yOff   = g.position.y;
+  const walls  = g.getObjectByName('walls');
+  const wScale = walls ? walls.scale.y : 1;
+  const wBase  = g.userData.wallBaseHeight || 0;
+  const wallM  = wBase * wScale;
+  _tileTweakHud.innerHTML =
+    '<b style="color:#0ff">tile tweak</b><br>' +
+    `<span style="color:#aaa">I / K</span> &nbsp;` +
+    `Y offset: <b style="color:#ff0">${yOff.toFixed(2)} m</b><br>` +
+    `<span style="color:#aaa">O / L</span> &nbsp;` +
+    `wall height: <b style="color:#ff0">${wallM.toFixed(2)} m</b> ` +
+    `<span style="color:#789">(× ${wScale.toFixed(2)})</span>`;
+}
 const hudObj      = document.getElementById('obj');
 const hudHacks    = document.getElementById('hacks');
 const overlay     = document.getElementById('overlay');
@@ -52,7 +91,29 @@ scene.add(sun);
 
 // Map — ~25% larger than previous 54×54
 const map = generateMap(68, 68, 18);
-buildMapMesh(map, scene);
+// Box-wall fallback. Stays visible until the GLB tileset finishes
+// loading, then we remove it. If the tileset load fails the fallback
+// keeps the level navigable (boxes for walls, flat plane for floor).
+const fallbackMapMesh = buildMapMesh(map, scene);
+let levelTilesGroup = null;
+buildLevelTiles(map, scene)
+  .then((group) => {
+    levelTilesGroup = group;
+    _refreshTileTweakHud();
+    if (fallbackMapMesh && fallbackMapMesh.parent) {
+      fallbackMapMesh.parent.remove(fallbackMapMesh);
+    }
+    // Doors placed before the tileset finished loading get their
+    // frames retro-attached now.
+    for (const d of doors) {
+      if (d._frameAttached) continue;
+      attachDoorFrame(levelTilesGroup, scene, d.x, d.z, d.corridorDir, d.slabWidth);
+      d._frameAttached = true;
+    }
+  })
+  .catch((err) => {
+    console.warn('level-tiles load failed; keeping box-wall fallback', err);
+  });
 
 // ── Destructible obstacles ──────────────────────────────────────────────────
 // Group adjacent grid==2 cells into Obstacle entities. Each has 2 HP and
@@ -426,7 +487,16 @@ function spawnCorridorDoors() {
     const hi = Math.max(lo + 1, Math.floor(valid.length * 0.75));
     const idx = lo + Math.floor(Math.random() * (hi - lo));
     const pt  = valid[idx];
-    doors.push(new Door(scene, pt.x, pt.y, pt.dir, pt.width));
+    {
+      const door = new Door(scene, pt.x, pt.y, pt.dir, pt.width);
+      doors.push(door);
+      // If the tileset has loaded already, attach the static frame
+      // immediately; otherwise the post-load handler retro-attaches.
+      if (levelTilesGroup) {
+        attachDoorFrame(levelTilesGroup, scene, pt.x, pt.y, pt.dir, pt.width);
+        door._frameAttached = true;
+      }
+    }
   }
 }
 spawnCorridorDoors();
@@ -515,6 +585,28 @@ window.addEventListener('keydown', e => {
   if (window.__nanoDebugLevel) return;
   if (gameOver || hacker.active || pendingHack) return;
   const k = e.key.toLowerCase();
+  // I / K — manual Y-offset for the loaded GLB tileset (debug only).
+  // The procedural map was modelled assuming the tile origins sit at
+  // y=0; if the GLB tiles' authored origins are above the floor they
+  // need to be nudged down. Step is 5 cm.
+  if (k === 'i' || k === 'k') {
+    if (levelTilesGroup) {
+      levelTilesGroup.position.y += (k === 'i' ? 0.05 : -0.05);
+      _refreshTileTweakHud();
+    }
+    return;
+  }
+  // O / L — scale the wall InstancedMesh's height. We multiply the
+  // wall group's Y scale (per-instance Y is already baked at build),
+  // so all walls stretch / shrink together. Step is 10% per press.
+  if (k === 'o' || k === 'l') {
+    const walls = levelTilesGroup?.getObjectByName('walls');
+    if (walls) {
+      walls.scale.y = Math.max(0.05, walls.scale.y + (k === 'o' ? 0.10 : -0.10));
+      _refreshTileTweakHud();
+    }
+    return;
+  }
   if (k === 'r') {
     // Possession shortcuts (no minigame):
     //   • Currently driving a mecha → R ejects.
@@ -980,6 +1072,9 @@ function animate() {
   }
 
   debug.update(player, enemies, battleMode);
+  // Tick crate debris on real time so the explosion-pop reads honestly
+  // even if the world is slow-mo'd. (Visual flourish only, not gated.)
+  updateCrateDebris(dt);
   renderer.render(scene, camera);
 }
 

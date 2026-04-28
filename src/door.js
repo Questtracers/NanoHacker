@@ -7,8 +7,11 @@ import * as THREE from 'three';
 // Door slab dimensions. The width is now per-instance — measured against the
 // corridor at spawn so the slab actually touches both walls of any-width
 // passage rather than being a one-size-fits-all 3-cell rectangle.
-const SLAB_THICKNESS  = 0.20;
-const SLAB_HEIGHT     = 1.5;
+// Slab thickness: thin so it reads as a door panel inside the GLB
+// frame. Slab height matches 2× the wall-tile height so the panel
+// fills the now-taller door frame opening.
+const SLAB_THICKNESS  = 0.02;
+const SLAB_HEIGHT     = 2.60;
 // Auto-open check: enemies approaching within these box bounds open the door.
 const TRIGGER_AHEAD   = 2.0; // cells along the travel axis
 const TRIGGER_SIDE    = 1.5; // cells along the perpendicular (3-wide corridor)
