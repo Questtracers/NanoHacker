@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { isWall, rayMarch, findPath, findValidFloor } from './map.js';
 import { makeFacingArrow } from './facing-arrow.js';
+import { MechaRig } from './mecha-rig.js';
 
 const STEALTH_CONE_ANGLE = Math.PI / 4;
 const STEALTH_CONE_RANGE = 8;
@@ -30,6 +31,15 @@ const POSSESSED_ROCKET_INTERVAL = POSSESSED_SHOT_INTERVAL * 3.0;
 // Hostile-AI rocket reload uses the same 3× ratio against the AI's slower
 // shootInterval (1.5 s) — about one rocket per 4.5 s of fire window.
 const ENEMY_ROCKET_INTERVAL = 1.5 * 3.0;
+// Auto-disarm timer for possessed mode — after the player stops firing,
+// the cannon/rocket lowers via the reverse animation. AI-mode disarm is
+// triggered by losing sight of the target (handled in the alerted-but-
+// targetless branch of update()).
+const POSSESSED_DISARM_TIMEOUT = 3.0;
+// AI-mode disarm-after-losing-sight delay — short window before we
+// commit to the lowering animation, so a quick hide-and-peek doesn't
+// flap the cannon up and down.
+const AI_DISARM_TIMEOUT        = 1.2;
 
 // `isStrictWall` ignores grid==2 (obstacles) and only treats true walls as
 // blockers, since a mecha rolls through obstacles and crushes them.
@@ -41,26 +51,37 @@ function isStrictWall(map, x, z) {
 
 export class Mecha {
   constructor(scene, x, z) {
-    // Same capsule silhouette as the soldier, scaled up so the radius equals
-    // half the old box width — keeps the chunky 70%-of-corridor footprint
-    // while reading as a beefed-up grunt instead of a generic crate.
-    const radius = BODY_SIZE / 2;     // 0.9
-    const cylLen = BODY_SIZE * 0.35;  // gives the mech a torso instead of a sphere
-    const body = new THREE.Mesh(
-      new THREE.CapsuleGeometry(radius, cylLen, 6, 14),
-      new THREE.MeshStandardMaterial({
-        color:    0xaa3344,
-        emissive: 0x330812,
-        roughness: 0.55, metalness: 0.65,
-      }),
-    );
-    // Capsule's centre is at length/2 + radius up from its bottom — but we
-    // anchor the bottom of the capsule on the floor by placing the centre at
-    // (cylLen/2 + radius). That sits the head above the body cleanly.
-    body.position.set(x, cylLen / 2 + radius, z);
-    body.castShadow = true;
-    scene.add(body);
-    this.mesh = body;
+    // Movement speed lives on the instance so the rig's leg cycle and
+    // the body's translation stay in sync. Both AI and possessed paths
+    // call _tryMove with this same value — there's no separate
+    // possessed-speed override.
+    this.speed = 1.4;
+    // MechaRig replaces the placeholder capsule — same architecture as
+    // Enemy + SoldierRig. The rig's root Group goes into the scene
+    // immediately at floor level (y=0); the FBX content streams in over
+    // the next few seconds. We alias `this.mesh` to rig.root so all the
+    // existing AI / collision / cone / HP-bar code keeps reading
+    // position from the same place. Rig's moveSpeed is bound to
+    // this.speed so the leg-cycle rate matches actual translation.
+    this.rig = new MechaRig(scene, { moveSpeed: this.speed });
+    this.rig.position = { x, z };
+    this.rig.load();
+    this.mesh = this.rig.root;
+    // Track previous frame position so we can derive a movement vector
+    // for the rig's locomotion blend tree each tick.
+    this._lastX = x;
+    this._lastZ = z;
+    // Shooting state machine layered on top of the rig's primitives.
+    //   _wantsShot   — AI flagged a fan-shot but cannon isn't held yet;
+    //                  fire it the moment the raise animation completes.
+    //   _wantsRocket — same for rockets.
+    //   _disarmTimer — counts down while armed and not firing; on expiry
+    //                  we call disarmCannon / disarmRocket. Possessed
+    //                  uses POSSESSED_DISARM_TIMEOUT (post-shot reset);
+    //                  AI uses AI_DISARM_TIMEOUT (lose-sight reset).
+    this._wantsShot   = false;
+    this._wantsRocket = false;
+    this._disarmTimer = 0;
 
     // Vision cone — same triangle-fan trick as the soldier.
     this.coneSegments = 30;
@@ -98,7 +119,8 @@ export class Mecha {
     this.targetFacing = this.facing;
     this.bulletFacing   = null;
     this.turnBoostTimer = 0;
-    this.speed   = 1.4;
+    // this.speed is set near the top of the constructor before the rig
+    // is built so the rig's moveSpeed picks up the right value.
     this.alive   = true;
     this.alerted          = false;
     this.losingSightTimer = 0;
@@ -293,6 +315,57 @@ export class Mecha {
     aim(angle + SPREAD);
   }
 
+  _spawnRocketAtFacing(game, owner) {
+    if (typeof game?.spawnRocket !== 'function') return;
+    const fx = Math.sin(this.facing);
+    const fz = Math.cos(this.facing);
+    const offset = 1.2;
+    game.spawnRocket(
+      this.mesh.position.x + fx * offset,
+      this.mesh.position.z + fz * offset,
+      fx, fz, owner, this,
+    );
+  }
+
+  // ── AI shooting helpers (animation-driven) ────────────────────────────
+  // AI must show the cannon-raise animation BEFORE firing the first shot.
+  // Subsequent shots while still held use the recoil pump. This wraps the
+  // raw fan + rocket spawns with the rig state machine.
+  _aiFireFan(game, owner) {
+    if (!this.rig) {                  // rig not loaded → fall back to a
+      this._shootFan(game, owner);    // direct shot (still functional)
+      return true;
+    }
+    if (!this.rig.isCannonHeld) {
+      // Kick off the raise (idempotent — re-calling while raising is a
+      // no-op inside the rig). Bullet fires next frame once held.
+      if (!this.rig.isCannoning) this.rig.triggerCannon();
+      this._wantsShot = true;
+      return false;
+    }
+    // Held → fire + recoil pump
+    this._shootFan(game, owner);
+    this.rig.triggerCannon();
+    this._wantsShot = false;
+    return true;
+  }
+
+  _aiFireRocket(game, owner) {
+    if (!this.rig) {
+      this._spawnRocketAtFacing(game, owner);
+      return true;
+    }
+    if (!this.rig.isRocketHeld) {
+      if (!this.rig.isRocketing) this.rig.triggerRocket();
+      this._wantsRocket = true;
+      return false;
+    }
+    this._spawnRocketAtFacing(game, owner);
+    this.rig.triggerRocket();
+    this._wantsRocket = false;
+    return true;
+  }
+
   _facingError() {
     let diff = this.targetFacing - this.facing;
     while (diff >  Math.PI) diff -= Math.PI * 2;
@@ -344,40 +417,68 @@ export class Mecha {
     this.facingArrow.position.set(fp.x, 0.04, fp.z);
     this.facingArrow.rotation.y = this.facing;
     this.facingArrow.visible    = this.alive;
+
+    // Possessed disarm timer — counts down after each shot. When it
+    // expires we play the reverse-arm animation back to battle/normal
+    // pose. Stays armed (and the timer paused at 0) only while shots
+    // are live; the timer is reset to POSSESSED_DISARM_TIMEOUT inside
+    // playerFire / playerFireRocket on every successful shot.
+    if (this._disarmTimer > 0) {
+      this._disarmTimer -= dt;
+      if (this._disarmTimer <= 0 && this.rig) {
+        if (this.rig.isCannonHeld && !this.rig._disarming) this.rig.disarmCannon();
+        if (this.rig.isRocketHeld && !this.rig._disarming) this.rig.disarmRocket();
+      }
+    }
+
+    this._driveRig(dt);
   }
 
   // Public hook used by the host's SPACE key listener while possessed.
   // Returns true if a volley was fired, false if still on cooldown.
+  // Possessed shots SKIP the raise animation — first shot snaps the
+  // cannon to held instantly and pumps the recoil; subsequent shots
+  // pump again. Disarm timer resets on every shot.
   playerFire(game) {
     if (!this.alive || !this.possessed) return false;
     if (this.shootCooldown > 0) return false;
-    this._shootFan(game, 'player');
+    if (this.rig) {
+      if (!this.rig.isCannonHeld) this.rig.snapCannonHeld();
+      this._shootFan(game, 'player');
+      this.rig.triggerCannon();          // recoil pump
+    } else {
+      this._shootFan(game, 'player');
+    }
     this.shootCooldown = POSSESSED_SHOT_INTERVAL;
+    this._disarmTimer  = POSSESSED_DISARM_TIMEOUT;
     return true;
   }
 
   // F-key handler while possessed. Spawns a single rocket along the mecha's
-  // current facing — explodes on contact, big AOE. Long cooldown.
+  // current facing — explodes on contact, big AOE. Long cooldown. Same
+  // skip-the-raise treatment as playerFire.
   playerFireRocket(game) {
     if (!this.alive || !this.possessed) return false;
     if (this.rocketCooldown > 0) return false;
     if (typeof game?.spawnRocket !== 'function') return false;
-    const fx = Math.sin(this.facing);
-    const fz = Math.cos(this.facing);
-    // Spawn slightly ahead of the body so the rocket doesn't immediately
-    // self-detonate against the mecha's own hit radius.
-    const offset = 1.2;
-    game.spawnRocket(
-      this.mesh.position.x + fx * offset,
-      this.mesh.position.z + fz * offset,
-      fx, fz, 'player', this,
-    );
+    if (this.rig) {
+      if (!this.rig.isRocketHeld) this.rig.snapRocketHeld();
+      this._spawnRocketAtFacing(game, 'player');
+      this.rig.triggerRocket();          // recoil pump
+    } else {
+      this._spawnRocketAtFacing(game, 'player');
+    }
     this.rocketCooldown = POSSESSED_ROCKET_INTERVAL;
+    this._disarmTimer   = POSSESSED_DISARM_TIMEOUT;
     return true;
   }
 
   update(dt, map, world, game) {
-    if (!this.alive) return;
+    if (!this.alive) {
+      // Keep the rig ticking so the death animation plays through.
+      if (this.rig) this.rig.update(dt);
+      return;
+    }
     // Real dt for rotation + shoot cadence so wind-up reads honestly during
     // slow-mo. Movement still uses dt (worldDt).
     const realDt = world?.realDt ?? dt;
@@ -444,22 +545,19 @@ export class Mecha {
       const owner = this.faction === 'friendly' ? 'player' : 'enemy';
       if (aligned && dist < BATTLE_CONE_RANGE) {
         // Rocket goes first when ready — heavier punch, longer cooldown, so
-        // it pre-empts the regular fan when both timers are off CD.
+        // it pre-empts the regular fan when both timers are off CD. Both
+        // calls are routed through the rig's animation state machine:
+        // first call kicks off the arm-up animation and DEFERS the shot;
+        // once held the same call fires + pumps recoil. Cooldown only
+        // resets on actual firing so the deferred frames don't burn it.
         if (this.rocketCooldown <= 0 && typeof game?.spawnRocket === 'function') {
-          const fx = Math.sin(this.facing);
-          const fz = Math.cos(this.facing);
-          const offset = 1.2;
-          game.spawnRocket(
-            this.mesh.position.x + fx * offset,
-            this.mesh.position.z + fz * offset,
-            fx, fz, owner, this,
-          );
-          this.rocketCooldown = this.rocketInterval;
+          if (this._aiFireRocket(game, owner)) {
+            this.rocketCooldown = this.rocketInterval;
+          }
         } else if (this.shootCooldown <= 0) {
-          // Friendly mechas shoot bullets that can damage hostiles, hostile
-          // mechas shoot enemy-coloured bullets that hit the player + allies.
-          this._shootFan(game, owner);
-          this.shootCooldown = this.shootInterval;
+          if (this._aiFireFan(game, owner)) {
+            this.shootCooldown = this.shootInterval;
+          }
         }
       }
     } else if (this.alerted) {
@@ -468,7 +566,19 @@ export class Mecha {
       this.aimSampleTimer = 0;
       this.losingSightTimer += dt;
       // Drift forward in the last facing direction while searching.
-      this._tryMove(Math.sin(this.facing), Math.cos(this.facing), dt * 0.4, map, world);
+      // Uses worldDt like the rest of the AI so SUPERHOT slow-mo
+      // applies — when the player stops moving in battle, the searching
+      // mecha throttles down with everything else.
+      this._tryMove(Math.sin(this.facing), Math.cos(this.facing), dt, map, world);
+      // Lost-sight disarm: after a brief window the mecha lowers its
+      // cannon / rocket via the reverse animation, ending in the battle
+      // posture. The mecha STAYS alerted (battleMode) — only the held
+      // weapon comes down. If the player re-emerges in the cone, the
+      // shooting flow re-arms naturally on the next fire intent.
+      if (this.rig && this.losingSightTimer > AI_DISARM_TIMEOUT) {
+        if (this.rig.isCannonHeld && !this.rig._disarming)  this.rig.disarmCannon();
+        if (this.rig.isRocketHeld && !this.rig._disarming)  this.rig.disarmRocket();
+      }
       if (this.losingSightTimer >= LOSE_SIGHT_TIME) {
         this.alerted          = false;
         this.losingSightTimer = 0;
@@ -530,6 +640,27 @@ export class Mecha {
     this.facingArrow.position.set(fp.x, 0.04, fp.z);
     this.facingArrow.rotation.y = this.facing;
     this.facingArrow.visible    = this.alive;
+
+    this._driveRig(dt);
+  }
+
+  // Push frame state into the MechaRig: facing, battle-mode flag, and
+  // a unit-vector movement direction derived from the position delta
+  // since last frame. Then tick the mixer. Called from both AI update()
+  // and _possessedUpdate() so the rig always reflects what the body is
+  // doing this frame.
+  _driveRig(dt) {
+    if (!this.rig) return;
+    this.rig.facing     = this.facing;
+    this.rig.battleMode = this.alerted;
+    const dx = this.mesh.position.x - this._lastX;
+    const dz = this.mesh.position.z - this._lastZ;
+    const len = Math.hypot(dx, dz);
+    if (len > 1e-5) this.rig.setMovement(dx / len, dz / len);
+    else            this.rig.setMovement(0, 0);
+    this._lastX = this.mesh.position.x;
+    this._lastZ = this.mesh.position.z;
+    this.rig.update(dt);
   }
 
   _updateHpBar(dt, cameraYaw = 0) {
@@ -565,6 +696,7 @@ export class Mecha {
     this.hpTimer = 3.5;
     this.hpBarBg.visible = true;
     this.hpBarFg.visible = true;
+    if (this.rig && this.hp > 0) this.rig.triggerHit();
     if (this.hp <= 0) this.kill();
   }
 
@@ -588,8 +720,17 @@ export class Mecha {
     this.hpBarFg.visible = true;
     this.alerted          = false;
     this.losingSightTimer = 0;
-    this.mesh.material.color.setHex(0x3399ff);
-    this.mesh.material.emissive.setHex(0x113355);
+    // Friendly-tint every mesh under the rig. Rig hierarchy may have
+    // multiple SkinnedMesh / Mesh nodes with multiple materials each,
+    // so traverse and tint them all.
+    if (this.mesh) {
+      this.mesh.traverse((c) => {
+        if (!c.isMesh && !c.isSkinnedMesh) return;
+        const tint = (m) => { if (m.emissive) m.emissive.setHex(0x113355); };
+        if (Array.isArray(c.material)) c.material.forEach(tint);
+        else if (c.material)            tint(c.material);
+      });
+    }
     this.coneMat.color.setHex(0x66ccff);
   }
 
@@ -607,6 +748,10 @@ export class Mecha {
     // Player tempo is faster on both weapons.
     this.rocketInterval = POSSESSED_ROCKET_INTERVAL;
     this.rocketCooldown = 0;
+    // Don't auto-disarm immediately on entry — only after a shot is fired.
+    this._disarmTimer  = 0;
+    this._wantsShot    = false;
+    this._wantsRocket  = false;
   }
 
   leavePossession() {
@@ -616,11 +761,21 @@ export class Mecha {
     this.shootCooldown  = this.shootInterval;
     this.rocketInterval = ENEMY_ROCKET_INTERVAL;
     this.rocketCooldown = ENEMY_ROCKET_INTERVAL;
+    this._disarmTimer   = 0;
+    // Disarm any held weapon when the player leaves so the AI takes
+    // over with a clean state.
+    if (this.rig) {
+      if (this.rig.isCannonHeld && !this.rig._disarming) this.rig.disarmCannon();
+      if (this.rig.isRocketHeld && !this.rig._disarming) this.rig.disarmRocket();
+    }
   }
 
   kill() {
     this.alive               = false;
-    this.mesh.visible        = false;
+    // Don't hide the rig — let the death animation play and clamp at
+    // the final pose. The rig keeps ticking via update() in the early-
+    // return / dead path so the clip plays through.
+    if (this.rig) this.rig.triggerDeath();
     this.coneMesh.visible    = false;
     this.facingArrow.visible = false;
     this.hpBarBg.visible     = false;

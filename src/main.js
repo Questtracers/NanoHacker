@@ -324,6 +324,9 @@ const mechas = [];
     placed++;
   }
 }
+// Diagnostic hook for in-page testing — gives the preview console
+// access to the live game state. Safe to leave; only adds globals.
+window.__nano = { mechas, get player() { return player; }, get game() { return game; }, scene };
 
 // Debug system — TAB
 const debug = new DebugSystem(scene);

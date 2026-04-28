@@ -54,7 +54,13 @@ const ANIM_FILES = {
 // floor-arrow in the main game (`facingTri.rotation.y = facing`). Setting
 // it to π would make body 180° opposite to the arrow.
 const MESH_FACING_OFFSET = 0;
-const CLIP_SPEED         = 1.4;         // m/s baked into the strider clips
+// Authored leg-cycle speed of the strider clips, in m/s. Higher value =
+// slower visible leg cycle relative to MOVE_SPEED (timeScale = MOVE/CLIP).
+// The crouch walks were authored slow; with the player's 4.5 m/s base
+// speed the legs visibly raced ahead of the body. Bumped to 3.2 so the
+// timeScale lands near 1.4× — still snappy but readable against the
+// camera's apparent motion.
+const CLIP_SPEED         = 3.2;
 const BLEND_RATE         = 8;           // 1/s — move + hack scalar ramp
 const MODE_BLEND_RATE    = 4;           // 1/s — slower posture swap
 const FBX_SCALE          = 2.0;         // 2× the Mixamo native size so the FBX

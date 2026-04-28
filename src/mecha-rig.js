@@ -118,6 +118,12 @@ export class MechaRig {
     this._cannonHeld = false;          // true once raise reverse-clip arrives at t=0
     this._rocketing  = false;          // raising / holding rocket-arm pose
     this._rocketHeld = false;          // true once forward play arrives at t=duration
+    // Disarm phase — set to 'cannon' or 'rocket' while the lowering/un-arming
+    // animation is playing. While set, the post-mixer Spine anchor is
+    // disabled so the body actually follows the cannon/rocket clip's
+    // authored lowering pose instead of staying frozen in aim. Cleared
+    // by the 'finished' listener.
+    this._disarming  = null;
 
     this._actions = {
       idle:       null,
@@ -375,6 +381,95 @@ export class MechaRig {
     if (!this._cannoning) this._spineFbxTarget = null;
   }
 
+  // ── Possessed-mode entry points ─────────────────────────────────────
+  // The player firing should not show the raise animation — the cannon
+  // appears already-held the instant the first shot leaves. snapCannonHeld
+  // jumps to the held pose silently (no raise), and the caller follows up
+  // with triggerCannon() to play the recoil pump for the actual shot.
+  snapCannonHeld() {
+    if (this._dying) return false;
+    const a = this._actions.cannon;
+    if (!a) return false;
+    if (this._rocketing) this.resetRocket();
+    this._cannoning  = true;
+    this._cannonHeld = true;
+    this._disarming  = null;
+    this._spineFbxTarget = null;
+    this._pendingSpineCapture = true;
+    a.setLoop(THREE.LoopOnce, 1);
+    a.clampWhenFinished = true;
+    a.reset();
+    a.time      = 0;
+    a.timeScale = 1;
+    a.paused    = true;          // freeze at held aim pose
+    a.setEffectiveWeight(0);     // cannonBlend ramps this up
+    a.play();
+    return true;
+  }
+
+  snapRocketHeld() {
+    if (this._dying) return false;
+    const a = this._actions.rocket;
+    if (!a) return false;
+    const clip = a.getClip();
+    const dur = clip ? clip.duration : 0;
+    if (dur <= 0) return false;
+    if (this._cannoning) this.resetCannon();
+    this._rocketing  = true;
+    this._rocketHeld = true;
+    this._disarming  = null;
+    this._spineFbxTarget = null;
+    this._pendingSpineCapture = true;
+    a.setLoop(THREE.LoopOnce, 1);
+    a.clampWhenFinished = true;
+    a.reset();
+    a.time      = dur;
+    a.timeScale = 1;
+    a.paused    = true;
+    a.setEffectiveWeight(0);
+    a.play();
+    return true;
+  }
+
+  // ── Smooth disarm (reverses the raise) ──────────────────────────────
+  // Cannon: held pose lives at t=0 (reversed playback); to lower we play
+  // FORWARD from 0 → duration. Rocket: held at t=duration; to un-arm we
+  // play REVERSED from duration → 0. _disarming flag suppresses the
+  // post-mixer Spine anchor for the duration of the lowering so the
+  // animated lowering pose is actually visible.
+  disarmCannon() {
+    if (!this._cannoning || this._disarming) return false;
+    const a = this._actions.cannon;
+    if (!a) return false;
+    this._cannonHeld = false;
+    this._disarming  = 'cannon';
+    a.paused = false;
+    a.time      = 0;
+    a.timeScale = CANNON_RAISE_RATE;     // forward, same speed as raise
+    a.setLoop(THREE.LoopOnce, 1);
+    a.clampWhenFinished = false;         // let the action stop at the end
+    a.play();
+    return true;
+  }
+
+  disarmRocket() {
+    if (!this._rocketing || this._disarming) return false;
+    const a = this._actions.rocket;
+    if (!a) return false;
+    const clip = a.getClip();
+    const dur = clip ? clip.duration : 0;
+    if (dur <= 0) return false;
+    this._rocketHeld = false;
+    this._disarming  = 'rocket';
+    a.paused = false;
+    a.time      = dur;
+    a.timeScale = -ROCKET_RAISE_RATE;    // reversed, same speed as arm-up
+    a.setLoop(THREE.LoopOnce, 1);
+    a.clampWhenFinished = false;
+    a.play();
+    return true;
+  }
+
   // ── Loading ─────────────────────────────────────────────────────────
   load() {
     if (this._loadingPromise) return this._loadingPromise;
@@ -433,6 +528,25 @@ export class MechaRig {
           this._mixer.addEventListener('finished', (e) => {
             if (this._actions.hit && e.action === this._actions.hit) {
               this._hitting = false;
+            }
+            // Disarm completion — finalize the cannon/rocket state so
+            // the locomotion bundle takes back over via cannonBlend → 0.
+            if (this._disarming === 'cannon' &&
+                this._actions.cannon && e.action === this._actions.cannon) {
+              this._disarming  = null;
+              this._cannoning  = false;
+              this._cannonHeld = false;
+              this._spineFbxTarget = null;
+              this._pendingSpineCapture = false;
+              this._actions.cannon.stop();
+            } else if (this._disarming === 'rocket' &&
+                this._actions.rocket && e.action === this._actions.rocket) {
+              this._disarming  = null;
+              this._rocketing  = false;
+              this._rocketHeld = false;
+              this._spineFbxTarget = null;
+              this._pendingSpineCapture = false;
+              this._actions.rocket.stop();
             }
             // Cannon: after the reverse-raise (or recoil pump) completes,
             // arrive at the held aim pose. clampWhenFinished keeps time
@@ -689,7 +803,8 @@ export class MechaRig {
       this._spineBone.quaternion.set(0, 0, 0, 1);
       this._diag.adjustDeg   = preSpine.angleTo(this._spineBone.quaternion) * 180 / Math.PI;
       this._diag.compensated = true;
-    } else if (armBlend > 0.001 && this._spineBone && this._spineFbxTarget && this._fbx) {
+    } else if (armBlend > 0.001 && !this._disarming &&
+               this._spineBone && this._spineFbxTarget && this._fbx) {
       const spineParent = this._spineBone.parent;
       if (spineParent) {
         // desiredSpineWorld = fbxWorld * target_relative_to_fbx

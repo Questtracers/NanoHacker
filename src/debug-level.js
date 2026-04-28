@@ -1,25 +1,31 @@
 import * as THREE from 'three';
-import { MechaRig } from './mecha-rig.js';
+import { Player } from './player.js';
+import { Mecha }  from './mecha.js';
+import { Drone }  from './drone.js';
+import { Bullet } from './bullet.js';
+import { Rocket } from './rocket.js';
 
-// Debug arena — player-piloted Rocket Mecha preview.
+// Debug arena — gameplay sandbox.
 //
-// One MechaRig dropped onto an empty floor; the player drives it as if
-// it were possessed in the main game. WASD is camera-relative movement
-// (same swizzle as Player), Q/E rotates the body. The blend tree picks
-// idle / forward / back / strafe based on the world movement projected
-// onto the mecha's facing — so rotating mid-stride lets you watch the
-// strafe clips fade in.
+// Drops one Mecha (full AI) and the Player into an empty walkable room
+// so the user can watch the cannon-arm flow, hit reactions, recoil pumps,
+// disarm reversal, etc. all in one place without the rest of the
+// gameplay layer (drones, doors, hacks, soldiers, level geometry).
 //
 // Controls:
 //   • WASD       — move (camera-relative)
 //   • Q / E      — rotate facing
-//   • TAB        — toggle normal / battle locomotion bundle
+//   • SPACE      — pistol shot
+//   • TAB        — toggle: alert the mecha manually (debug)
+//   • H          — hack-link the mecha (flips it to faction=friendly)
+//   • P          — possess / eject the (hack-linked) mecha
+//   • F          — rocket while possessed
 
 const CAM_YAW    = Math.PI * 75 / 180;
-const CAM_RADIUS = 14;
-const CAM_HEIGHT = 11;
-const MOVE_SPEED = 2.0;          // m/s
-const TURN_SPEED = Math.PI;      // rad/s — same as Player
+const CAM_RADIUS = 16;
+const CAM_HEIGHT = 13;
+const ARENA_HALF = 24;     // half-extent in cells; arena is 2× this
+const PLAYER_MAX_HP = 2;
 
 export function runDebugLevel() {
   // Tell the main game module to stand down.
@@ -41,18 +47,20 @@ export function runDebugLevel() {
   document.body.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  scene.fog = new THREE.Fog(0x0a0d14, 30, 90);
+  scene.fog = new THREE.Fog(0x0a0d14, 40, 110);
 
+  const floorSize = ARENA_HALF * 2;
   const floor = new THREE.Mesh(
-    new THREE.PlaneGeometry(60, 60),
+    new THREE.PlaneGeometry(floorSize, floorSize),
     new THREE.MeshStandardMaterial({ color: 0x1c1f29, roughness: 0.9 }),
   );
   floor.rotation.x = -Math.PI / 2;
+  floor.position.set(ARENA_HALF, 0, ARENA_HALF);   // arena spans 0..floorSize
   floor.receiveShadow = true;
   scene.add(floor);
 
-  const grid = new THREE.GridHelper(60, 60, 0x224466, 0x162132);
-  grid.position.y = 0.001;
+  const grid = new THREE.GridHelper(floorSize, floorSize, 0x224466, 0x162132);
+  grid.position.set(ARENA_HALF, 0.001, ARENA_HALF);
   scene.add(grid);
 
   scene.add(new THREE.AmbientLight(0x99aabb, 0.55));
@@ -60,8 +68,8 @@ export function runDebugLevel() {
   sun.position.set(8, 14, 6);
   sun.castShadow = true;
   sun.shadow.mapSize.set(1024, 1024);
-  sun.shadow.camera.left = -12; sun.shadow.camera.right = 12;
-  sun.shadow.camera.top  =  12; sun.shadow.camera.bottom = -12;
+  sun.shadow.camera.left = -16; sun.shadow.camera.right = 16;
+  sun.shadow.camera.top  =  16; sun.shadow.camera.bottom = -16;
   scene.add(sun);
   const rim = new THREE.DirectionalLight(0x6688ff, 0.4);
   rim.position.set(-6, 8, -4);
@@ -76,6 +84,101 @@ export function runDebugLevel() {
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
+  // ── Stub map ───────────────────────────────────────────────────────────
+  // The gameplay code (Mecha AI, bullets) imports map utilities that
+  // expect a `{ width, height, grid }` object. Build a fully-walkable
+  // grid sized to the arena — every cell is 0 (floor), no walls, no
+  // obstacles. Good enough for vision, ray-march, and BFS pathing in
+  // the open arena.
+  const W = floorSize, H = floorSize;
+  const map = {
+    width: W,
+    height: H,
+    grid: Array.from({ length: H }, () => Array.from({ length: W }, () => 0)),
+    rooms: [],
+  };
+
+  // ── Obstacles ──────────────────────────────────────────────────────────
+  // A handful of waist-high blocks scattered around the arena center so
+  // there's actual geometry to hide behind / sweep cones over. Each
+  // entry is { x, z, w, d, h }: world-space center + footprint and height.
+  // We mark every covered grid cell as 1 (wall) so rayMarch / vision
+  // cones / pathfinding all treat them as obstacles.
+  const obstacles = [
+    { x: ARENA_HALF + 1,  z: ARENA_HALF - 5, w: 3, d: 1.5, h: 1.4 },
+    { x: ARENA_HALF - 4,  z: ARENA_HALF + 3, w: 1.5, d: 4, h: 1.4 },
+    { x: ARENA_HALF + 6,  z: ARENA_HALF + 6, w: 2.5, d: 2.5, h: 2.0 },
+    { x: ARENA_HALF - 7,  z: ARENA_HALF - 7, w: 2, d: 2, h: 1.6 },
+    { x: ARENA_HALF,      z: ARENA_HALF + 9, w: 4, d: 1, h: 1.2 },
+  ];
+  const obstacleMat = new THREE.MeshStandardMaterial({
+    color: 0x4a3322, roughness: 0.85, metalness: 0.1,
+  });
+  for (const o of obstacles) {
+    const geo = new THREE.BoxGeometry(o.w, o.h, o.d);
+    const mesh = new THREE.Mesh(geo, obstacleMat);
+    mesh.position.set(o.x, o.h / 2, o.z);
+    mesh.castShadow    = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    // Mark the covered grid cells as walls so rayMarch / vision blocks.
+    const x0 = Math.floor(o.x - o.w / 2);
+    const x1 = Math.ceil (o.x + o.w / 2);
+    const z0 = Math.floor(o.z - o.d / 2);
+    const z1 = Math.ceil (o.z + o.d / 2);
+    for (let z = z0; z < z1; z++) {
+      for (let x = x0; x < x1; x++) {
+        if (z >= 0 && z < H && x >= 0 && x < W) map.grid[z][x] = 1;
+      }
+    }
+  }
+
+  // ── Player ─────────────────────────────────────────────────────────────
+  const playerStart = { x: ARENA_HALF - 6, z: ARENA_HALF };
+  const player = new Player(scene, playerStart.x, playerStart.z);
+  player.hp = PLAYER_MAX_HP;
+  let playerHp = PLAYER_MAX_HP;
+
+  // ── Mecha ──────────────────────────────────────────────────────────────
+  const mechaStart = { x: ARENA_HALF + 6, z: ARENA_HALF };
+  const mecha = new Mecha(scene, mechaStart.x, mechaStart.z);
+
+  // ── Drone ──────────────────────────────────────────────────────────────
+  // One drone wandering the opposite side so the visual upgrades (FBX
+  // model, body yaw, pitch banking, recoil offset) can be observed.
+  const droneStart = { x: ARENA_HALF - 8, z: ARENA_HALF + 4 };
+  const drones = [new Drone(scene, droneStart.x, droneStart.z, null)];
+
+  // Diagnostic hook for in-page testing.
+  window.__nanoSandbox = {
+    player, mecha, drones, scene,
+    get bullets() { return bullets; },
+  };
+
+  // ── World / game stubs ────────────────────────────────────────────────
+  const bullets = [];
+  const world = {
+    player,
+    enemies: [],
+    drones,
+    mechas:  [mecha],
+    realDt: 0,
+    cameraYaw: CAM_YAW,
+    destroyObstacleAt() { /* obstacles are static in the sandbox */ },
+  };
+  const game = {
+    spawnBullet(x, z, dx, dz, owner = 'enemy', shooter = null) {
+      bullets.push(new Bullet(scene, x, z, dx, dz, owner, shooter));
+    },
+    spawnRocket(x, z, dx, dz, owner = 'player', shooter = null) {
+      bullets.push(new Rocket(scene, x, z, dx, dz, owner, shooter));
+    },
+    obstacleAt() { return null; },
+    damageObstacleAt() {},
+    destroyObstacleAt() {},
+    cellBlockedByDoor() { return false; },
+  };
+
   // ── HUD ────────────────────────────────────────────────────────────────
   const hud = document.createElement('div');
   hud.style.cssText = [
@@ -88,134 +191,141 @@ export function runDebugLevel() {
   ].join(';');
   document.body.appendChild(hud);
 
-  // ── Mecha rig ──────────────────────────────────────────────────────────
-  const mecha = new MechaRig(scene, { moveSpeed: MOVE_SPEED });
-  window.__mecha = mecha;   // diagnostic hook for testing
-  mecha.position = { x: 0, z: 0 };
-  mecha.facing   = 0;
-  mecha.load();
-
-  // ── Input ──────────────────────────────────────────────────────────────
-  const keys = new Set();
+  // ── Extra debug input ─────────────────────────────────────────────────
+  // Player.constructor wires WASD/Q/E itself. We only listen for our
+  // sandbox-specific shortcuts on top.
+  let battleMode = false;
+  let shotCooldown = 0;
+  let slowMoActive = false;        // for HUD readout
+  const SHOT_COOLDOWN = 0.6;
   window.addEventListener('keydown', (e) => {
-    keys.add(e.key.toLowerCase());
-    if (e.key === 'Tab') {
+    const k = e.key.toLowerCase();
+    if (k === 'tab') {
       e.preventDefault();
-      mecha.battleMode = !mecha.battleMode;
+      // Manually flip alert state for testing (also triggers battle mode).
+      mecha.alerted = !mecha.alerted;
+      if (mecha.alerted) mecha.aimedPos = { x: player.position.x, z: player.position.z };
     }
-    // T / G — scrub the cannon/rocket recoil rate live (±0.1 per press).
-    // Read at fire time, so the next SPACE / R press uses the new value.
-    if (e.key === 't' || e.key === 'T') {
-      mecha.recoilRate = Math.max(0.1, mecha.recoilRate + 0.1);
-    }
-    if (e.key === 'g' || e.key === 'G') {
-      mecha.recoilRate = Math.max(0.1, mecha.recoilRate - 0.1);
-    }
-    // Y / H — scrub the recoil offset (how many frames the pump rewinds
-    // before snapping back). Step is 1 frame at 30 fps = 0.0333 s.
-    const FRAME_STEP = 1 / 30;
-    if (e.key === 'y' || e.key === 'Y') {
-      mecha.recoilOffset = mecha.recoilOffset + FRAME_STEP;
-    }
-    if (e.key === 'h' || e.key === 'H') {
-      mecha.recoilOffset = Math.max(FRAME_STEP, mecha.recoilOffset - FRAME_STEP);
-    }
-    // U / J — scrub the additive arm-overlay intensity (cannon + rocket).
-    // >1 extrapolates the additive delta past the authored pose so the aim
-    // dominates the underlying walk-arm swing.
-    if (e.key === 'u' || e.key === 'U') {
-      mecha.armIntensity = Math.min(40, mecha.armIntensity + 1);
-    }
-    if (e.key === 'j' || e.key === 'J') {
-      mecha.armIntensity = Math.max(0, mecha.armIntensity - 1);
-    }
-    // O — fire a hit reaction (additive, retriggers on every press).
-    if (e.key === 'o' || e.key === 'O') {
-      mecha.triggerHit();
-    }
-    // L — play the death one-shot. Press again to reset and retrigger.
-    if (e.key === 'l' || e.key === 'L') {
-      if (mecha.isDying) mecha.resetDeath();
-      mecha.triggerDeath();
-    }
-    // SPACE — first press: reverse-play the cannon clip into the held
-    // aim pose. Subsequent presses while held: recoil pump.
-    if (e.key === ' ' || e.code === 'Space') {
+    if (k === ' ' || e.code === 'Space') {
       e.preventDefault();
-      mecha.triggerCannon();
+      // Player fan / pistol shot — single bullet if not possessed, else
+      // hand off to the mecha's possessed fire path.
+      if (mecha.possessed) {
+        mecha.playerFire(game);
+        return;
+      }
+      if (shotCooldown > 0) return;
+      const d = player.facingDir;
+      const len = Math.hypot(d.x, d.z) || 1;
+      game.spawnBullet(
+        player.position.x + (d.x / len) * 0.6,
+        player.position.z + (d.z / len) * 0.6,
+        d.x / len, d.z / len, 'player', player,
+      );
+      shotCooldown = SHOT_COOLDOWN;
     }
-    // R — same mechanic as SPACE but for the rocket-arm clip (forward).
-    if (e.key === 'r' || e.key === 'R') {
-      mecha.triggerRocket();
+    if (k === 'f') {
+      if (mecha.possessed) mecha.playerFireRocket(game);
     }
-    // M — toggle the spine-identity sanity test. Forces spine.quaternion
-    // to identity post-mixer, regardless of cannon/rocket state. If the
-    // upper body visibly straightens when toggled on, the bone reference
-    // works. If nothing changes, the bone we found isn't the one the
-    // mixer / renderer is actually using.
-    if (e.key === 'm' || e.key === 'M') {
-      mecha.forceSpineIdentity = !mecha.forceSpineIdentity;
+    if (k === 'h') {
+      if (mecha.alive && mecha.faction !== 'friendly') mecha.hackLink();
+    }
+    if (k === 'p') {
+      if (mecha.possessed) {
+        mecha.leavePossession();
+        player.mesh.visible = true;
+        player.facingTri.visible = true;
+      } else if (mecha.alive && mecha.faction === 'friendly') {
+        mecha.enterPossession();
+        player.mesh.position.x = mecha.mesh.position.x;
+        player.mesh.position.z = mecha.mesh.position.z;
+        player.mesh.visible = false;
+        player.facingTri.visible = false;
+      }
     }
   });
-  window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
 
-  // Driver state — mirrors the player-possessed-mecha control flow from
-  // the main game.
-  const charPos = new THREE.Vector3(0, 0, 0);
-  let   facing  = 0;
-
-  // Renders the post-mixer Spine counter-rotation diagnostics. Lets us
-  // verify (1) bones got captured, (2) the held-pose target was snapshot,
-  // (3) armBlend ramps to 1, and (4) the per-frame block is actually
-  // changing spine.quaternion (adjustDeg > 0). If hipsWorldDeg moves but
-  // adjustDeg stays 0, something earlier in the chain is broken; if both
-  // are non-zero but you still see arm drift, the lock is misaiming.
-  function diagBlock(d, forceMode) {
-    if (!d) return '<br><b style="color:#f66">DIAG: no diagnostics object on rig</b>';
-    const yes = (b) => b ? '<b style="color:#0f8">yes</b>' : '<b style="color:#f66">NO</b>';
-    const heat = (deg) => {
-      if (deg < 0.05) return '#566';
-      if (deg < 1)   return '#fc4';
-      return '#0f8';
-    };
-    return '<br><span style="color:#888">— spine anchor —</span>' +
-      `<br>frame#: <b style="color:#cfe">${d.frame}</b>` +
-      ` &nbsp; force-id (M): <b style="color:${forceMode ? '#f44' : '#566'}">${forceMode ? 'ON' : 'off'}</b>` +
-      `<br>hips: <b style="color:#cfe">${d.hipsName || '<not found>'}</b>` +
-      `<br>spine: <b style="color:#cfe">${d.spineName || '<not found>'}</b>` +
-      ` <span style="color:#789">(parent: ${d.spineParent || '?'})</span>` +
-      `<br>target captured: ${yes(d.targetCaptured)}` +
-      ` &nbsp; armBlend: <b>${d.armBlend.toFixed(3)}</b>` +
-      `<br>compensated this frame: ${yes(d.compensated)}` +
-      `<br>adjust: <b style="color:${heat(d.adjustDeg)}">${d.adjustDeg.toFixed(2)}°</b>` +
-      ` &nbsp; hipsWorld: <b style="color:${heat(d.hipsWorldDeg)}">${d.hipsWorldDeg.toFixed(1)}°</b>`;
+  // Bullet collision against player + mecha. Player gets damaged by
+  // 'enemy' bullets (mecha's regular fire), mecha gets hit by 'player'
+  // bullets. Friendly fire is on for everything else.
+  function tickBullets(dt) {
+    for (const b of bullets) {
+      if (!b.alive) continue;
+      b.update(dt, map, player, [], game);
+      if (!b.alive) continue;
+      // Player hit
+      if (b.owner === 'enemy' && !mecha.possessed) {
+        const dx = b.mesh.position.x - player.position.x;
+        const dz = b.mesh.position.z - player.position.z;
+        if (dx * dx + dz * dz < 0.7) {
+          playerHp = Math.max(0, playerHp - (b.damage || 1));
+          b.destroy();
+          continue;
+        }
+      }
+      // Mecha hit
+      if (b.owner === 'player' && b.shooter !== mecha) {
+        const dx = b.mesh.position.x - mecha.mesh.position.x;
+        const dz = b.mesh.position.z - mecha.mesh.position.z;
+        const r = mecha.hitRadius || 1;
+        if (dx * dx + dz * dz < r * r) {
+          mecha.takeDamage(b.damage || 1);
+          b.destroy();
+          continue;
+        }
+      }
+      // Drone hits — player shots damage hostile drones; the drone's own
+      // shots damage the player (handled above via owner==='enemy').
+      if (b.owner === 'player') {
+        for (const d of drones) {
+          if (!d.alive || d.faction !== 'hostile' || b.shooter === d) continue;
+          const dx = b.mesh.position.x - d.mesh.position.x;
+          const dz = b.mesh.position.z - d.mesh.position.z;
+          if (dx * dx + dz * dz < 0.45 * 0.45) {
+            d.takeDamage(b.damage || 1);
+            b.destroy();
+            break;
+          }
+        }
+      }
+    }
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      if (!bullets[i].alive) bullets.splice(i, 1);
+    }
   }
 
   function setHud() {
-    const ready = mecha.loaded;
-    const facingDeg = ((facing * 180 / Math.PI) % 360 + 360) % 360;
-    const mode = mecha.battleMode ? 'BATTLE' : 'NORMAL';
-    const modeColor = mecha.battleMode ? '#f88' : '#7ef';
+    const possessed = mecha.possessed ? 'POSSESSED' : (mecha.faction === 'friendly' ? 'FRIENDLY' : 'HOSTILE');
+    const possessedColor = mecha.possessed ? '#0f8'
+                         : (mecha.faction === 'friendly' ? '#7ef' : '#f88');
+    const armState = mecha.rig?.isCannonHeld ? 'CANNON HELD'
+                   : mecha.rig?.isCannoning   ? 'CANNON RAISING'
+                   : mecha.rig?.isRocketHeld  ? 'ROCKET HELD'
+                   : mecha.rig?.isRocketing   ? 'ROCKET ARMING'
+                   : mecha.rig?._disarming    ? 'DISARMING ' + mecha.rig._disarming.toUpperCase()
+                   : 'DOWN';
+    const armColor = (mecha.rig?.isCannonHeld || mecha.rig?.isRocketHeld) ? '#0f8'
+                   : (mecha.rig?._disarming) ? '#fa0'
+                   : (mecha.rig?.isCannoning || mecha.rig?.isRocketing) ? '#fc4'
+                   : '#566';
     hud.innerHTML =
-      '<b style="color:#0ff">DEBUG LEVEL — possessed mecha</b> <span style="color:#f4a">[build:spine-diag-v2]</span><br>' +
-      `loaded: <b>${(mecha.loadProgress * 100).toFixed(0)}%</b>` +
-      (ready ? '' : ' …') + '<br>' +
-      `mode:   <b style="color:${modeColor}">${mode}</b><br>` +
-      `pos:    <b>${charPos.x.toFixed(1)}, ${charPos.z.toFixed(1)}</b><br>` +
-      `facing: <b>${facingDeg.toFixed(0)}°</b><br>` +
-      `recoilRate (T/G): <b style="color:#ff0">${mecha.recoilRate.toFixed(2)}</b>` +
-      ` &nbsp; recoilFrames (Y/H): <b style="color:#ff0">${(mecha.recoilOffset * 30).toFixed(1)}f</b>` +
-      ` <span style="color:#789">(${mecha.recoilOffset.toFixed(3)}s)</span><br>` +
-      `armIntensity (U/J): <b style="color:#ff0">${mecha.armIntensity.toFixed(2)}</b><br>` +
-      `hit (O): <b style="color:${mecha.isHit ? '#fa0' : '#566'}">${mecha.isHit ? 'PLAYING' : 'idle'}</b>` +
-      ` &nbsp; death (L): <b style="color:${mecha.isDying ? '#f44' : '#566'}">${mecha.isDying ? 'DEAD' : 'alive'}</b><br>` +
-      `cannon (SPACE): <b style="color:${
-        mecha.isCannoning ? (mecha.isCannonHeld ? '#0f8' : '#fc4') : '#566'
-      }">${mecha.isCannoning ? (mecha.isCannonHeld ? 'AIMED' : 'RAISING') : 'down'}</b><br>` +
-      `rocket (R): <b style="color:${
-        mecha.isRocketing ? (mecha.isRocketHeld ? '#0f8' : '#fc4') : '#566'
-      }">${mecha.isRocketing ? (mecha.isRocketHeld ? 'ARMED' : 'ARMING') : 'down'}</b>` +
-      diagBlock(mecha.diagnostics, mecha.forceSpineIdentity);
+      '<b style="color:#0ff">DEBUG LEVEL — gameplay sandbox</b><br>' +
+      'WASD move • Q/E turn • SPACE shoot<br>' +
+      'TAB alert • H hack • P possess • F rocket(possessed)<br>' +
+      `mode: <b style="color:${battleMode ? '#f88' : '#7ef'}">${battleMode ? 'BATTLE' : 'STEALTH'}</b>` +
+      ` &nbsp; slow-mo: <b style="color:${slowMoActive ? '#fc4' : '#566'}">${slowMoActive ? 'ON (8%)' : 'off'}</b><br>` +
+      '<br>' +
+      `Player HP: <b style="color:${playerHp <= 0 ? '#f44' : '#cfe'}">${playerHp} / ${PLAYER_MAX_HP}</b><br>` +
+      `Mecha HP:  <b>${mecha.hp} / ${mecha.maxHp}</b> ` +
+      `<span style="color:${possessedColor}">[${possessed}]</span><br>` +
+      `alerted: <b style="color:${mecha.alerted ? '#f88' : '#7ef'}">${mecha.alerted ? 'YES' : 'no'}</b>` +
+      ` &nbsp; loseSightT: <b>${(mecha.losingSightTimer || 0).toFixed(1)}s</b><br>` +
+      `arm state: <b style="color:${armColor}">${armState}</b><br>` +
+      `shootCD: <b>${Math.max(0, mecha.shootCooldown).toFixed(1)}s</b>` +
+      ` &nbsp; rocketCD: <b>${Math.max(0, mecha.rocketCooldown).toFixed(1)}s</b>` +
+      (mecha.possessed
+        ? `<br>disarmTimer: <b>${Math.max(0, mecha._disarmTimer || 0).toFixed(1)}s</b>`
+        : '');
   }
 
   // ── Update / render loop ───────────────────────────────────────────────
@@ -223,48 +333,58 @@ export function runDebugLevel() {
   function tick() {
     requestAnimationFrame(tick);
     const dt = Math.min(clock.getDelta(), 0.05);
+    world.realDt = dt;
 
-    // ── Q/E rotation ─────────────────────────────────────────────────
-    let turn = 0;
-    if (keys.has('q')) turn += 1;     // matches Player: Q = screen-left turn
-    if (keys.has('e')) turn -= 1;     //                  E = screen-right turn
-    if (turn) {
-      facing += turn * TURN_SPEED * dt;
-      while (facing >  Math.PI) facing -= Math.PI * 2;
-      while (facing < -Math.PI) facing += Math.PI * 2;
+    if (shotCooldown > 0) shotCooldown -= dt;
+
+    // ── Player update first so movedThisFrame is fresh for slow-mo ────
+    if (mecha.possessed) {
+      // Possessed: mecha reads player.keys and drives itself.
+      // Keep the player ghost glued to the mecha so anything looking up
+      // world.player.position sees the mecha's spot.
+      player.mesh.position.x = mecha.mesh.position.x;
+      player.mesh.position.z = mecha.mesh.position.z;
+    } else {
+      player.update(dt, map, null, battleMode, shotCooldown <= 0);
     }
 
-    // ── WASD camera-relative movement ───────────────────────────────
-    let ix = 0, iz = 0;
-    if (keys.has('w')) iz -= 1;
-    if (keys.has('s')) iz += 1;
-    if (keys.has('a')) ix -= 1;
-    if (keys.has('d')) ix += 1;
-    const len = Math.hypot(ix, iz);
-    let wx = 0, wz = 0;
-    if (len > 0) {
-      ix /= len; iz /= len;
-      wx =  iz;
-      wz = -ix;
-      charPos.x += wx * MOVE_SPEED * dt;
-      charPos.z += wz * MOVE_SPEED * dt;
-    }
+    // ── SUPERHOT slow-mo ─────────────────────────────────────────────
+    // Same rule as main.js: while battle mode is active AND the player
+    // isn't moving, the world ticks at 8% speed. Possessed-mecha mode
+    // counts WASD-on-mecha as "moving" so the slow-mo lifts whenever
+    // the human is at the wheel and steering.
+    const ctrlMoved = mecha.possessed
+      ? ['w','a','s','d'].some(k => player.keys.has(k))
+      : player.movedThisFrame;
+    let worldDt = dt;
+    slowMoActive = battleMode && !ctrlMoved;
+    if (slowMoActive) worldDt = dt * 0.08;
 
-    // Push state into the rig.
-    mecha.position = charPos;
-    mecha.facing   = facing;
-    mecha.setMovement(len > 0 ? wx : 0, len > 0 ? wz : 0);
-    mecha.update(dt);
+    mecha.update(worldDt, map, world, game);
+    for (const d of drones) d.update(worldDt, map, world, game, performance.now() / 1000);
+    tickBullets(worldDt);
 
-    // ── Camera follow ────────────────────────────────────────────────
-    camera.position.set(
-      charPos.x + Math.sin(CAM_YAW) * CAM_RADIUS,
-      CAM_HEIGHT,
-      charPos.z + Math.cos(CAM_YAW) * CAM_RADIUS,
-    );
-    camera.lookAt(charPos.x, 1.0, charPos.z);
+    battleMode =
+      (!!mecha.alerted  && mecha.faction !== 'friendly') ||
+      drones.some(d => d.alive && d.alerted && d.faction === 'hostile');
 
     setHud();
+
+    // ── Camera follow ────────────────────────────────────────────────
+    // Center on the midpoint between player and mecha so both are
+    // always in frame, with a slight bias toward whichever is
+    // currently being controlled.
+    const focus = mecha.possessed ? mecha.mesh.position : player.position;
+    const other = mecha.possessed ? player.position : mecha.mesh.position;
+    const cx = focus.x * 0.7 + other.x * 0.3;
+    const cz = focus.z * 0.7 + other.z * 0.3;
+    camera.position.set(
+      cx + Math.sin(CAM_YAW) * CAM_RADIUS,
+      CAM_HEIGHT,
+      cz + Math.cos(CAM_YAW) * CAM_RADIUS,
+    );
+    camera.lookAt(cx, 1.0, cz);
+
     renderer.render(scene, camera);
   }
   tick();

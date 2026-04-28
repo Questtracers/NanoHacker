@@ -1,6 +1,24 @@
 import * as THREE from 'three';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { isWall, rayMarch, findValidFloor, findPath } from './map.js';
 import { makeFacingArrow } from './facing-arrow.js';
+
+// Drone visual parameters — separate from the cone / AI logic.
+// `facing` = cone direction (legacy, used for AI + vision).
+// `bodyFacing` = the model's yaw, follows movement / shoot direction
+//                independently of the cone. Smoothed toward target.
+// `bodyPitch`  = forward tilt scaling with cone yaw rate, so the model
+//                visibly "leans" when it's scanning fast and flattens
+//                when it holds still. Smoothed by an exp-blend term.
+const BODY_TURN_SPEED      = 6.0;            // rad/s body smoothing
+const BODY_PITCH_SCALE     = 0.45;           // rad / (rad/s) cone yaw rate
+const BODY_PITCH_MAX       = Math.PI * 0.18; // cap pitch at ~32°
+const BODY_PITCH_BLEND_RATE = 6.0;           // 1/s exp blend toward target
+// Recoil — total duration in seconds, peak displacement in metres.
+// Curve: fast attack to peak (15 % of duration), then easing back to 0.
+const RECOIL_DURATION      = 0.5;
+const RECOIL_DISTANCE      = 0.25;
+const RECOIL_ATTACK_FRAC   = 0.15;
 
 const STEALTH_CONE_ANGLE = Math.PI / 8; // half the soldier's spread
 const BATTLE_CONE_ANGLE  = Math.PI / 6;
@@ -16,19 +34,76 @@ const AIM_SAMPLE_INTERVAL = 0.35; // s of real time between aim re-locks
 
 export class Drone {
   constructor(scene, x, z, firstTarget = null) {
-    // Body: small floating sphere, pink/magenta to read as different from
-    // the red capsule soldiers.
-    const body = new THREE.Mesh(
-      new THREE.SphereGeometry(0.32, 14, 14),
+    // Two-layer visual: `bodyRoot` tracks the logic position (mesh
+    // alias for collision / cone / HP-bar code); `bodyVis` is a child
+    // group that holds the actual model and applies yaw, pitch, and
+    // recoil offset purely visually so the cone stays anchored to the
+    // logic position regardless of how the body kicks around.
+    this.hoverBase = 1.0;
+    this.bodyRoot = new THREE.Group();
+    this.bodyRoot.position.set(x, this.hoverBase, z);
+    scene.add(this.bodyRoot);
+
+    this.bodyVis = new THREE.Group();
+    this.bodyRoot.add(this.bodyVis);
+
+    // Placeholder — small magenta sphere shown until the FBX streams in.
+    const placeholder = new THREE.Mesh(
+      new THREE.SphereGeometry(0.32, 12, 12),
       new THREE.MeshStandardMaterial({
         color: 0xff66cc, emissive: 0x551133, roughness: 0.3, metalness: 0.6,
       }),
     );
-    body.position.set(x, 1.0, z); // hovers a bit above the floor
-    body.castShadow = true;
-    scene.add(body);
-    this.mesh = body;
-    this.hoverBase = 1.0;
+    placeholder.castShadow = true;
+    this.bodyVis.add(placeholder);
+    this._placeholder = placeholder;
+
+    // Stream in the actual FBX model. Auto-scale to ~0.7 m largest extent
+    // so it reads at a similar footprint to the placeholder. Fixed-up
+    // material setup (sRGB textures, tighter PBR) once it's loaded.
+    new FBXLoader().load(
+      'Assets/Drone/Drone.fbx',
+      (fbx) => {
+        const box = new THREE.Box3().setFromObject(fbx);
+        const size = box.getSize(new THREE.Vector3());
+        const native = Math.max(size.x, size.y, size.z) || 1;
+        const scale = 0.7 / native;
+        fbx.scale.setScalar(scale);
+        fbx.traverse((c) => {
+          if (!c.isMesh && !c.isSkinnedMesh) return;
+          c.castShadow    = true;
+          c.receiveShadow = true;
+          const fix = (m) => {
+            if (m.map) {
+              m.map.colorSpace = THREE.SRGBColorSpace;
+              m.map.anisotropy = 4;
+            }
+            m.metalness = 0.5;
+            m.roughness = 0.4;
+            if (m.color && m.map) m.color.set(0xffffff);
+            m.needsUpdate = true;
+          };
+          if (Array.isArray(c.material)) c.material.forEach(fix);
+          else if (c.material)            fix(c.material);
+        });
+        // Center the model on the bodyVis origin so yaw/pitch rotate
+        // around a sensible point, not an offset corner.
+        box.setFromObject(fbx);
+        const center = box.getCenter(new THREE.Vector3());
+        fbx.position.sub(center);
+        // Swap placeholder for the real model.
+        this.bodyVis.remove(this._placeholder);
+        this._placeholder = null;
+        this.bodyVis.add(fbx);
+        this._modelLoaded = true;
+        // If hack-linked while loading, re-tint the new mesh.
+        if (this.faction === 'friendly') this._applyFactionTint();
+      },
+      undefined,
+      (err) => console.error('Drone: failed to load Drone.fbx', err),
+    );
+
+    this.mesh = this.bodyRoot;
 
     // Vision cone (same triangle-fan trick as the soldier, narrower half-angle)
     this.coneSegments = 24;
@@ -57,6 +132,17 @@ export class Drone {
     this.facing          = Math.random() * Math.PI * 2;
     this.bulletFacing    = null; // transient override when reacting to bullets
     this.turnBoostTimer  = 0;
+    // Visual body state — separate from cone facing. The model rotates
+    // toward movement / shoot direction; pitch tracks cone yaw rate.
+    this.bodyFacing      = this.facing;
+    this.bodyPitch       = 0;
+    this._lastFacing     = this.facing;
+    this._lastBodyX      = x;
+    this._lastBodyZ      = z;
+    // Recoil timer ticks down from RECOIL_DURATION on each shot.
+    this._recoilTimer    = 0;
+    this._recoilFacing   = this.facing;
+    this._modelLoaded    = false;
 
     this.speed   = 2.6;
     this.alive   = true;
@@ -277,6 +363,11 @@ export class Drone {
         const fz = Math.cos(this.facing);
         game.spawnBullet(this.mesh.position.x, this.mesh.position.z, fx, fz, owner, this);
         this.shootCooldown = this.shootInterval;
+        // Visual recoil — body kicks back along the shot direction
+        // for ~0.5 s. Snap-aim the body toward the shot for the kick
+        // window so the offset reads as a clean recoil along the
+        // muzzle, regardless of which way the body was drifting.
+        this._kickRecoil(this.facing);
       }
       // Clear any stale wander route so we start fresh once alert ends.
       this.routePath = null;
@@ -294,11 +385,12 @@ export class Drone {
           this.losingSightTimer = 0;
         }
       }
-      // Cone sweep — real-time during stealth (so the player can read the
-      // sweep). While alerted-but-blocked the cone holds still: a sweeping
-      // cone would keep re-acquiring the player every rotation and reset
-      // the de-alert timer, which isn't what we want during slow-mo.
-      if (!boosting && !this.alerted) this.facing -= CONE_ROT_SPEED * realDt;
+      // Cone sweep — uses worldDt so SUPERHOT slow-mo applies: when the
+      // player stops moving in battle the cone visibly pauses too,
+      // matching the rest of the world. While alerted-but-blocked the
+      // cone holds still: a sweeping cone would keep re-acquiring the
+      // player every rotation and reset the de-alert timer.
+      if (!boosting && !this.alerted) this.facing -= CONE_ROT_SPEED * dt;
 
       // Wander via BFS routes — soldier-style corridor following, random dests.
       if (!this.routePath || this.pathPos >= this.routePath.length) {
@@ -325,6 +417,14 @@ export class Drone {
     // Soft separation from soldiers, other drones and mechas so a swarm
     // can't bunch up into a single visual blob.
     this._avoidOthers(world, dt, map);
+
+    // ── Drone body visuals ───────────────────────────────────────────
+    // Yaw target: most recent shot for half a second, otherwise the
+    // movement direction since last frame. Pitch tracks cone yaw rate
+    // (faster scan → more pitched). Recoil offsets the visual model
+    // relative to the bodyRoot. All purely cosmetic — the AI / cone /
+    // collision math reads from bodyRoot.position which stays put.
+    this._updateBodyVisuals(dt, realDt);
 
     this.updateConeMesh(map);
     this._updateHpBar(dt, world?.cameraYaw);
@@ -387,6 +487,97 @@ export class Drone {
     }
   }
 
+  // ── Body visuals — yaw, pitch, recoil ─────────────────────────────
+  // Independent from cone facing so the model rotates toward where
+  // it's MOVING / FIRING, while the cone keeps scanning. Pitch banks
+  // forward in proportion to how fast the cone is yawing — gives the
+  // drone a "leaning into the scan" read instead of a static turret.
+  _updateBodyVisuals(dt, realDt) {
+    if (dt <= 0) dt = 1e-6;
+    // ── Body yaw target ────────────────────────────────────────────
+    // While the recoil window is live we lock the body to the shot
+    // direction so the kick reads cleanly. Otherwise: movement-based
+    // when actually moving, else stay where we last pointed.
+    let target = this.bodyFacing;
+    if (this._recoilTimer > 0) {
+      target = this._recoilFacing;
+    } else {
+      const dx = this.mesh.position.x - this._lastBodyX;
+      const dz = this.mesh.position.z - this._lastBodyZ;
+      const moveLen = Math.hypot(dx, dz);
+      if (moveLen > 0.005) target = Math.atan2(dx, dz);
+    }
+    // Smooth toward target (shortest arc).
+    let diff = target - this.bodyFacing;
+    while (diff >  Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    const yawStep = Math.min(Math.abs(diff), BODY_TURN_SPEED * dt);
+    this.bodyFacing += Math.sign(diff) * yawStep;
+
+    // ── Pitch from cone yaw rate ───────────────────────────────────
+    // Cone yaw delta this frame → angular speed → target pitch.
+    // Sign: pitch FORWARD (negative rotation.x in three.js convention
+    // where +Z is forward) regardless of yaw direction; we use the
+    // magnitude of the rate, not its sign, so the drone "leans" the
+    // same way left or right.
+    let conYawRate = this.facing - this._lastFacing;
+    while (conYawRate >  Math.PI) conYawRate -= Math.PI * 2;
+    while (conYawRate < -Math.PI) conYawRate += Math.PI * 2;
+    conYawRate = conYawRate / dt;                              // rad/s
+    const targetPitch = -Math.max(
+      -BODY_PITCH_MAX,
+      Math.min(BODY_PITCH_MAX, Math.abs(conYawRate) * BODY_PITCH_SCALE),
+    );
+    const pitchStep = Math.min(1, dt * BODY_PITCH_BLEND_RATE);
+    this.bodyPitch += (targetPitch - this.bodyPitch) * pitchStep;
+    this._lastFacing  = this.facing;
+    this._lastBodyX   = this.mesh.position.x;
+    this._lastBodyZ   = this.mesh.position.z;
+
+    // ── Recoil offset ─────────────────────────────────────────────
+    // Curve: linear ramp up to peak in RECOIL_ATTACK_FRAC of duration,
+    // then ease back down to 0 over the rest. Offset is in WORLD
+    // units along the negative-of-facing axis (kick backward).
+    let recoilAmp = 0;
+    if (this._recoilTimer > 0) {
+      this._recoilTimer -= dt;
+      const phase = 1 - Math.max(0, this._recoilTimer) / RECOIL_DURATION;
+      if (phase < RECOIL_ATTACK_FRAC) {
+        recoilAmp = phase / RECOIL_ATTACK_FRAC;
+      } else {
+        recoilAmp = 1 - (phase - RECOIL_ATTACK_FRAC) / (1 - RECOIL_ATTACK_FRAC);
+      }
+      if (this._recoilTimer <= 0) this._recoilTimer = 0;
+    }
+    const recoilDist = recoilAmp * RECOIL_DISTANCE;
+    const recoilX = -Math.sin(this._recoilFacing) * recoilDist;
+    const recoilZ = -Math.cos(this._recoilFacing) * recoilDist;
+
+    // ── Push to bodyVis ───────────────────────────────────────────
+    this.bodyVis.position.set(recoilX, 0, recoilZ);
+    this.bodyVis.rotation.y = this.bodyFacing;
+    this.bodyVis.rotation.x = this.bodyPitch;
+  }
+
+  _kickRecoil(facing) {
+    this._recoilTimer  = RECOIL_DURATION;
+    this._recoilFacing = facing;
+  }
+
+  _applyFactionTint() {
+    if (!this.bodyVis) return;
+    const friendly = this.faction === 'friendly';
+    this.bodyVis.traverse((c) => {
+      if (!c.isMesh && !c.isSkinnedMesh) return;
+      const tint = (m) => {
+        if (m.color)    m.color.setHex(friendly ? 0x66ccff : 0xff66cc);
+        if (m.emissive) m.emissive.setHex(friendly ? 0x113355 : 0x551133);
+      };
+      if (Array.isArray(c.material)) c.material.forEach(tint);
+      else if (c.material)            tint(c.material);
+    });
+  }
+
   onBulletNearby(bulletDx, bulletDz) {
     if (!this.alive) return;
     // Defer the actual turn to update(): store the target angle + boost
@@ -406,10 +597,10 @@ export class Drone {
     this.hpTimer = 5;
     this.hpBarBg.visible = true;
     this.hpBarFg.visible = true;
-    if (this.mesh?.material) {
-      this.mesh.material.color.setHex(0x66ccff);
-      if (this.mesh.material.emissive) this.mesh.material.emissive.setHex(0x113355);
-    }
+    // Tint runs against whichever child is currently in bodyVis —
+    // placeholder sphere or the loaded FBX model. _applyFactionTint
+    // also runs again on FBX load if hack happened during streaming.
+    this._applyFactionTint();
     this.alerted          = false;
     this.losingSightTimer = 0;
     this.routePath        = null;
