@@ -247,9 +247,14 @@ export class HackMinigame {
     const clockTime = document.createElement('div');
     clockTime.id = 'hack-clock-time';
 
-    clockPanel.appendChild(clockLabel);
-    clockPanel.appendChild(clockFace);
-    clockPanel.appendChild(clockTime);
+    // Wrap the clock elements in a single section so the tutorial
+    // can hide / show them as a unit.
+    const clockSection = document.createElement('div');
+    clockSection.id = 'hack-clock-section';
+    clockSection.appendChild(clockLabel);
+    clockSection.appendChild(clockFace);
+    clockSection.appendChild(clockTime);
+    clockPanel.appendChild(clockSection);
 
     // ── Hack-points counter
     const hpSection = document.createElement('div');
@@ -281,15 +286,26 @@ export class HackMinigame {
     this.outputEl     = output;
     this.inputEl      = input;
     this.statusEl     = document.getElementById('hack-status');
-    this.clockFaceEl  = clockFace;
-    this.clockTimeEl  = clockTime;
-    this.clockLabelEl = clockLabel;
-    this.inputRowEl   = inputRow;
-    this.hpValueEl    = hpValue;
+    this.clockFaceEl    = clockFace;
+    this.clockTimeEl    = clockTime;
+    this.clockLabelEl   = clockLabel;
+    this.clockSectionEl = clockSection;
+    this.hpSectionEl    = hpSection;
+    this.inputRowEl     = inputRow;
+    this.hpValueEl      = hpValue;
 
     form.addEventListener('submit', e => {
       e.preventDefault();
       const raw = input.value;
+      // Tutorial gate — validator can veto the submission. We still
+      // clear the input so the player knows the keystroke was seen,
+      // and we forward the raw value to the validator so it can
+      // decide whether the typed call matched the expected one.
+      if (typeof this._inputValidator === 'function' &&
+          this._inputValidator(raw) === false) {
+        input.value = '';
+        return;
+      }
       input.value = '';
       this._appendLines([`C:\\NULL_ROUTE> <span class="hk-num">${this._esc(raw || ' ')}</span>`]);
       this._runCommand(raw);
@@ -297,7 +313,14 @@ export class HackMinigame {
 
     document.addEventListener('keydown', e => {
       if (!this.active) return;
-      if (e.key === 'Escape') { e.preventDefault(); this.close(); }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        // ESC is suppressed during the tutorial so the player can't
+        // bail out of the practice hack and skip the rest of the
+        // mentor's narration.
+        if (this._tutorialMode) return;
+        this.close();
+      }
     });
 
     overlay.addEventListener('pointerdown', () => this.inputEl.focus());
@@ -313,12 +336,173 @@ export class HackMinigame {
     // Outcome callbacks — the host uses these to apply the hack-link effect
     // only when the player actually breaches the target.
     this._onClose = typeof opts.onClose === 'function' ? opts.onClose : null;
+    // Tutorial mode — when set:
+    //   • the breach timer doesn't start (and is hidden) until the host
+    //     calls revealAndStartClock(); the timer running out doesn't end
+    //     the run, the player can keep typing until they win.
+    //   • the hack-points readout is hidden so the tutorial isn't
+    //     littered with HUD readouts the player hasn't been told about.
+    // Both flags are reset to false in _reset() so a normal hack after
+    // the tutorial behaves identically to the live game.
+    this._tutorialMode      = !!opts.tutorialMode;
+    this._tutorialNoFail    = !!opts.tutorialMode;
+    this._clockHidden       = !!opts.tutorialMode;
+    this._clockFrozen       = !!opts.tutorialMode;
+    if (this.clockSectionEl) {
+      this.clockSectionEl.style.visibility = this._clockHidden ? 'hidden' : 'visible';
+    }
+    if (this.hpSectionEl) {
+      this.hpSectionEl.style.visibility    = opts.tutorialMode ? 'hidden' : 'visible';
+    }
+    // Tutorial opens with the input locked — the mentor narrates a
+    // few lines about the maze before letting the player type. The
+    // host re-enables it via `setInputEnabled(true)` when the
+    // narration reaches the "Plain functions add" step.
+    this.setInputEnabled(!opts.tutorialMode);
     this.active = true;
     this.awaitingDismiss = false;
     this.overlay.style.display = 'flex';
     this._reset();
     this._updateHPDisplay();
     setTimeout(() => this.inputEl.focus(), 30);
+  }
+
+  // ── Tutorial helpers ─────────────────────────────────────────────────────
+  // Position lookup + per-command callback used by the tutorial layer
+  // to (a) compute neighbour cells for highlight overlays and (b) react
+  // when the player successfully applies a maze-mutating command.
+
+  setOnCommandApplied(fn) { this._onCommandApplied = (typeof fn === 'function') ? fn : null; }
+
+  // Force-replace one of the four slots with a patch command whose
+  // delta will wrap a directly-connected node down to 0. Returns the
+  // exact `cmdFull` string the player must type. Used by the tutorial
+  // so the "Plain functions add" beat is guaranteed to have a valid
+  // teaching example regardless of the random seed of the run.
+  forceZeroingCommand() {
+    if (!this.board) return null;
+    const nodes = this._directlyConnectedNodes();
+    // Restrict to nodes on the maze's main route — stubs and spurs
+    // are decorative dead ends and the tutorial shouldn't push the
+    // player to zero them.
+    const mainSet = new Set(
+      (this._mainPathNodes || []).map(n => `${n.row},${n.col}`),
+    );
+    let value = 0;
+    for (const { r, c } of nodes) {
+      if (mainSet.size && !mainSet.has(`${r},${c}`)) continue;
+      const v = this.board[r][c]?.value;
+      if (v && v !== 0) { value = v; break; }
+    }
+    if (!value) return null;
+    // Find a delta in the patch-pool [-6..6] (excl 0) that zeros it.
+    let delta = null;
+    for (let d = -6; d <= 6; d++) {
+      if (d === 0) continue;
+      if (((value + d) % 10 + 10) % 10 === 0) { delta = d; break; }
+    }
+    if (delta === null) return null;
+    const verb = PATCH_VERBS[Math.floor(Math.random() * PATCH_VERBS.length)];
+    const cmd = {
+      kind:    'patch',
+      delta,
+      cmdFull: `${verb} ${fmtOp(delta)}`,
+      desc:    `${fmtOpPhrase(delta)} across link map [port ${randomPort()}]`,
+    };
+    // Replace slot 0 (or any slot — first one is fine; the player
+    // will read the cmd off the dialogue hint, not the slot index).
+    if (this.availableCommands && this.availableCommands.length > 0) {
+      this.availableCommands[0] = cmd;
+    } else {
+      this.availableCommands = [cmd];
+    }
+    // Deliberately DON'T call _appendDump() — re-rendering the
+    // whole board here would produce a duplicate map listing in
+    // the output as if the player had typed something. The cmd
+    // lands silently in the slot; the next _applyCommand will
+    // refresh the displayed option list naturally on its own.
+    return cmd.cmdFull;
+  }
+
+  // Auto-force-zeroing mode. When enabled, every replacement command
+  // generated by _generateReplacement is biased toward zeroing a
+  // main-path neighbour of the cursor. Used by the tutorial after
+  // the "hack before the timer" beat so the player can finish the
+  // maze comfortably without getting blocked by RNG.
+  setAutoForceZeroing(enabled) { this._autoForceZeroing = !!enabled; }
+
+  // Tutorial input gating — when set, the form-submit handler runs
+  // this validator BEFORE the command is dispatched. If it returns
+  // false, the submission is suppressed (no maze mutation, the
+  // input is cleared but the player isn't punished). Returns true
+  // to let the command proceed normally.
+  setInputValidator(fn) { this._inputValidator = (typeof fn === 'function') ? fn : null; }
+
+  // Lock / unlock the terminal input. Used by the tutorial so the
+  // player can't type a command before the mentor has finished
+  // explaining the board. While locked we also blur any current
+  // focus so the cursor doesn't blink in a frozen field.
+  setInputEnabled(enabled) {
+    if (!this.inputEl) return;
+    this.inputEl.disabled = !enabled;
+    this.inputEl.style.opacity = enabled ? '' : '0.4';
+    if (!enabled && document.activeElement === this.inputEl) this.inputEl.blur();
+  }
+
+  getCursorPos() { return { row: this.cursor.row, col: this.cursor.col }; }
+
+  getGoalCells() {
+    const t = this.targetCell;
+    if (!t) return [];
+    return Array.from({ length: this.targetWidth }, (_, k) => ({ row: t.row, col: t.col + k }));
+  }
+
+  // First non-conn / non-wall cell encountered when leaving `start` in
+  // each cardinal direction (skipping conn cells along the way).
+  // Used for highlighting the cells the player can jump to.
+  _firstReachable(start) {
+    const out = [];
+    if (!this.board) return out;
+    for (const d of DIRS) {
+      let r = start.row + d.dr;
+      let c = start.col + d.dc;
+      while (r >= 0 && r < ROWS && c >= 0 && c < COLS) {
+        const cell = this.board[r][c];
+        if (cell.type === 'conn')   { r += d.dr; c += d.dc; continue; }
+        if (cell.type === 'wall')   break;
+        if (cell.type !== 'target') out.push({ row: r, col: c });
+        break;
+      }
+    }
+    return out;
+  }
+  getCursorNeighbours() { return this._firstReachable(this.getCursorPos()); }
+  getGoalNeighbours() {
+    const seen = new Set();
+    const out  = [];
+    for (const goal of this.getGoalCells()) {
+      for (const n of this._firstReachable(goal)) {
+        const k = `${n.row},${n.col}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push(n);
+      }
+    }
+    return out;
+  }
+
+  // Tutorial entry point — reveal the breach timer and start it ticking.
+  // Called by the host when the narration reaches the "hack before time
+  // runs out" line. The no-fail flag stays on (player keeps trying even
+  // if the timer hits zero), but the visible countdown gives them the
+  // pressure beat the tutorial line is teaching.
+  revealAndStartClock() {
+    this._clockHidden = false;
+    this._clockFrozen = false;
+    if (this.clockSectionEl) this.clockSectionEl.style.visibility = 'visible';
+    // _startClock would normally be called once at the start of every
+    // hack run; in tutorial mode we deferred it. Kick it off now.
+    if (!this.clockTimer) this._startClock();
   }
 
   _updateHPDisplay() {
@@ -370,6 +554,15 @@ export class HackMinigame {
   }
 
   _timeUp() {
+    // Tutorial mode swallows the timeout — the player keeps the hack
+    // session open and can finish the maze at their own pace. The
+    // visible clock simply parks at 0.
+    if (this._tutorialNoFail) {
+      if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null; }
+      this.timeLeft = 0;
+      this._updateClock();
+      return;
+    }
     this.gameOver = true;
     this.awaitingDismiss = true;
     if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null; }
@@ -433,7 +626,11 @@ export class HackMinigame {
     // through conn cells to the first non-zero node — no auto-cascade.
     this._refreshCommands();
     this._updateStatus();
-    this._startClock();
+    // In tutorial mode the clock stays frozen + hidden until the host
+    // calls revealAndStartClock(); skip the auto-start so the timer
+    // doesn't tick down behind the hidden panel.
+    if (!this._clockFrozen) this._startClock();
+    else { this.timeLeft = HACK_TIME; this._updateClock(); }
     this._appendDump([
       `<span class="hk-ok">-- NanoHacker v1.0 | lvl ${this.difficulty} | breach initiated | target: ${this.targetAddr} --</span>`,
     ]);
@@ -538,6 +735,13 @@ export class HackMinigame {
     this.targetCell  = { row: tRow, col: tStart };
     this.targetWidth = 3;
 
+    // Snapshot the path nodes that belong to the MAIN ROUTE before
+    // spurs/stubs start pushing more entries into pathNodes. The
+    // tutorial's forceZeroingCommand uses this so it only suggests
+    // a function that mutates a node on the route to the goal —
+    // the dead-end branches get to stay quiet.
+    this._mainPathNodes = pathNodes.slice();
+
     // ── Spurs & stubs for variety. Only the cells actually overwritten need
     //    to be walls; a spur may occasionally brush against the main route
     //    and create a shortcut, which is fine — the player gets the odd
@@ -601,6 +805,37 @@ export class HackMinigame {
     return false;
   }
 
+  // Build a patch command whose delta zeros a main-path neighbour
+  // of the cursor. Returns null if no such delta exists in the
+  // standard [-6..6] pool. Used by tutorial auto-zeroing mode.
+  _makeMainPathZeroingPatch() {
+    if (!this.board) return null;
+    const mainSet = new Set(
+      (this._mainPathNodes || []).map(n => `${n.row},${n.col}`),
+    );
+    const nodes = this._directlyConnectedNodes();
+    let value = 0;
+    for (const { r, c } of nodes) {
+      if (mainSet.size && !mainSet.has(`${r},${c}`)) continue;
+      const v = this.board[r][c]?.value;
+      if (v && v !== 0) { value = v; break; }
+    }
+    if (!value) return null;
+    let delta = null;
+    for (let d = -6; d <= 6; d++) {
+      if (d === 0) continue;
+      if (((value + d) % 10 + 10) % 10 === 0) { delta = d; break; }
+    }
+    if (delta === null) return null;
+    const verb = PATCH_VERBS[Math.floor(Math.random() * PATCH_VERBS.length)];
+    return {
+      kind:    'patch',
+      delta,
+      cmdFull: `${verb} ${fmtOp(delta)}`,
+      desc:    `${fmtOpPhrase(delta)} across link map [port ${randomPort()}]`,
+    };
+  }
+
   // Build a patch command with a delta not shared by existing slots.
   _makePatchCommand(usedDeltas) {
     const pool = [];
@@ -628,6 +863,14 @@ export class HackMinigame {
       if (i === excludeIdx) continue;
       const c = this.availableCommands[i];
       if (c && c.kind === 'patch') usedDeltas.add(c.delta);
+    }
+
+    // Tutorial easy-mode — every replacement is steered toward a
+    // delta that zeros a main-path neighbour, so the player can
+    // keep stepping through the maze without RNG-blocking.
+    if (this._autoForceZeroing) {
+      const z = this._makeMainPathZeroingPatch();
+      if (z) return z;
     }
 
     const canPatch = this._hasConnectedNonZero();
@@ -708,7 +951,10 @@ export class HackMinigame {
   }
 
   _runCommand(raw) {
-    const input = raw.trim().toLowerCase();
+    // Tolerate sloppy input — trim leading/trailing whitespace and
+    // collapse any internal whitespace runs to a single space, then
+    // lowercase. So "  Nudge   5 " matches "nudge 5" cleanly.
+    const input = raw.trim().toLowerCase().replace(/\s+/g, ' ');
 
     // After a win or timeout we wait for the player to confirm the dismissal.
     // Only "y" / "yes" closes; anything else gets a hacker brush-off and the
@@ -823,6 +1069,13 @@ export class HackMinigame {
 
     this._updateStatus();
     this._appendDump();
+    // Tutorial hook — fired only after a real cell mutation. We pass
+    // whether the cursor actually moved so the tutorial can detect a
+    // "neighbour zeroed" outcome (cursor cascades when a connected
+    // cell becomes 0).
+    if (applied && this._onCommandApplied) {
+      this._onCommandApplied({ depth: this.depth, cursorMoved });
+    }
   }
 
   // Goal-reachable BFS used for the "did this op win the run?" check. Walks
@@ -1110,38 +1363,39 @@ export class HackMinigame {
   // ── Rendering ─────────────────────────────────────────────────────────────
 
   _renderCell(cell, row, col) {
+    // Every cell gets data-r / data-c attributes so the tutorial can
+    // locate specific positions (cursor, goal, neighbours) in the
+    // rendered DOM by querying the most recent board lines.
+    const dr = ` data-r="${row}" data-c="${col}"`;
     const isCursor = this.cursor.row === row && this.cursor.col === col;
-    if (isCursor) return `<span class="hk-cursor">${'0'.padEnd(CELL_W)}</span>`;
+    if (isCursor) return `<span class="hk-cursor"${dr}>${'0'.padEnd(CELL_W)}</span>`;
 
-    // Highlight the winning cursor→target route in success cyan.
     const onWinRoute = this.winRoute && this.winRoute.has(`${row},${col}`);
 
     if (cell.type === 'target') {
       const chunk = cell.chunk ?? 0;
       const start = chunk * CELL_W;
       const text  = this.targetAddr.slice(start, start + CELL_W).padEnd(CELL_W);
-      // Goal address always renders in its own yellow — even when the rest
-      // of the trail is blue post-win, "0x05c" stays the marker colour.
-      return `<span class="hk-target">${this._esc(text)}</span>`;
+      return `<span class="hk-target"${dr}>${this._esc(text)}</span>`;
     }
 
     if (cell.type === 'path') {
       const v = cell.value;
       if (v === 0) {
         const cls = onWinRoute ? 'hk-winroute' : (cell.locked ? 'hk-locked' : 'hk-zero');
-        return `<span class="${cls}">${' 0'}</span>`;
+        return `<span class="${cls}"${dr}>${' 0'}</span>`;
       }
       const text = String(v).padStart(CELL_W);
       const cls  = onWinRoute ? 'hk-winroute' : (v < 0 ? 'hk-neg' : 'hk-num');
-      return `<span class="${cls}">${text}</span>`;
+      return `<span class="${cls}"${dr}>${text}</span>`;
     }
 
     if (cell.type === 'conn') {
       const cls = onWinRoute ? 'hk-winroute' : 'hk-conn';
-      return `<span class="${cls}">${this._esc(cell.ip.slice(0, CELL_W).padEnd(CELL_W))}</span>`;
+      return `<span class="${cls}"${dr}>${this._esc(cell.ip.slice(0, CELL_W).padEnd(CELL_W))}</span>`;
     }
 
-    return `<span class="hk-wall">${this._esc(cell.token.slice(0, CELL_W).padEnd(CELL_W))}</span>`;
+    return `<span class="hk-wall"${dr}>${this._esc(cell.token.slice(0, CELL_W).padEnd(CELL_W))}</span>`;
   }
 
   _makeBoardLines() {
@@ -1151,16 +1405,22 @@ export class HackMinigame {
       const sfx   = Math.random() < 0.5
         ? ` <span class="hk-dim">${this._esc(SFX_POOL[Math.floor(Math.random() * SFX_POOL.length)])}</span>`
         : '';
-      return `${pfx}${cells}${sfx}`;
+      // Wrap each row in a parent span so the tutorial can target
+      // board cells distinctly from option-list cells (which share
+      // the .hk-num class).
+      return `<span class="hk-board-row">${pfx}${cells}${sfx}</span>`;
     });
   }
 
   _makeOptionLines() {
     return this.availableCommands.map((opt, i) => {
       const cls = opt.kind === 'routine' ? 'hk-routine' : 'hk-num';
-      return `<span class="hk-dim">fn[${i + 1}]</span> ` +
+      // Each option line wrapped so the "Watch the functions" tutorial
+      // step can highlight only the in-board function commands and not
+      // the side-panel premium powers.
+      return `<span class="hk-option-line"><span class="hk-dim">fn[${i + 1}]</span> ` +
         `<span class="${cls}">${this._esc(opt.cmdFull)}</span> ` +
-        `<span class="hk-comment">// ${this._esc(opt.desc)}</span>`;
+        `<span class="hk-comment">// ${this._esc(opt.desc)}</span></span>`;
     });
   }
 

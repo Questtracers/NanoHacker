@@ -4,7 +4,19 @@
       "mcp__Claude_Preview__preview_start",
       "Bash(where python *)",
       "Bash(where node *)",
-      "Bash(where npx *)"
+      "Bash(where npx *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:demo.quarks.art)",
+      "Bash(node --check \"C:/Users/Usuario/NanoHacker/src/tutorial-level.js\")",
+      "Bash(node --check \"C:/Users/Usuario/NanoHacker/src/hack.js\")",
+      "Bash(node --check \"C:/Users/Usuario/NanoHacker/src/corplogo.js\")",
+      "Bash(awk '{ for\\(i=1;i<=length\\($0\\);i++\\){c=substr\\($0,i,1\\); if\\(c==\"{\"\\)o++; if\\(c==\"}\"\\)cl++} } END{print \"open:\",o,\"close:\",cl}' \"C:/Users/Usuario/NanoHacker/src/tutorial-level.js\")",
+      "Bash(awk '{ for\\(i=1;i<=length\\($0\\);i++\\){c=substr\\($0,i,1\\); if\\(c==\"{\"\\)o++; if\\(c==\"}\"\\)cl++} } END{print \"open:\",o,\"close:\",cl}' \"C:/Users/Usuario/NanoHacker/src/hack.js\")",
+      "Bash(awk '{ for\\(i=1;i<=length\\($0\\);i++\\){c=substr\\($0,i,1\\); if\\(c==\"{\"\\)o++; if\\(c==\"}\"\\)cl++} } END{print \"open:\",o,\"close:\",cl}' \"C:/Users/Usuario/NanoHacker/src/corplogo.js\")",
+      "Bash(awk 'BEGIN{o=0;c=0} { for\\(i=1;i<=length\\($0\\);i++\\){ch=substr\\($0,i,1\\); if\\(ch==\"{\"\\)o++; if\\(ch==\"}\"\\)c++} } END{print \"hack.js braces:\",o,c}' \"C:/Users/Usuario/NanoHacker/src/hack.js\")",
+      "Bash(awk 'BEGIN{o=0;c=0} { for\\(i=1;i<=length\\($0\\);i++\\){ch=substr\\($0,i,1\\); if\\(ch==\"{\"\\)o++; if\\(ch==\"}\"\\)c++} } END{print \"tutorial-level.js braces:\",o,c}' \"C:/Users/Usuario/NanoHacker/src/tutorial-level.js\")",
+      "Bash(awk 'NR>=252 && NR<=305' \"C:/Users/Usuario/NanoHacker/src/tutorial-level.js\")",
+      "Bash(grep -n '`')"
     ]
   }
 }

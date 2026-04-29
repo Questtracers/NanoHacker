@@ -282,10 +282,12 @@ export class Drone {
     }
     pos.needsUpdate = true;
     this.coneMesh.geometry.computeBoundingSphere();
+    // Same palette as the soldier — keeps all hostile-AI cones reading
+    // as a single colour family regardless of unit type.
     if (this.faction === 'friendly') {
       this.coneMat.color.setHex(this.alerted ? 0x3388ff : 0x66ccff);
     } else {
-      this.coneMat.color.setHex(this.alerted ? 0xff3399 : 0xff66ff);
+      this.coneMat.color.setHex(this.alerted ? 0xff3030 : 0xffaa00);
     }
     this.coneMat.opacity = this.alerted ? 0.5 : 0.35;
   }
@@ -613,6 +615,15 @@ export class Drone {
     // timer so the cone rotates at TURN_SPEED_FAST instead of snapping.
     this.bulletFacing   = Math.atan2(-bulletDx, -bulletDz);
     this.turnBoostTimer = TURN_BOOST_TIME;
+  }
+
+  // World-space target for the hack-swarm VFX. Drones are floating
+  // bodies — there's no head bone to home on, so we just take the
+  // mesh centre. Same signature as Enemy.getHackTargetWorldPos for
+  // the host's swarm-spawn call site.
+  getHackTargetWorldPos(out = new THREE.Vector3()) {
+    out.copy(this.mesh.position);
+    return out;
   }
 
   hackLink() {

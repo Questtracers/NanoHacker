@@ -1,7 +1,59 @@
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { isWall, rayMarch, findPath, findValidFloor } from './map.js';
 import { makeFacingArrow } from './facing-arrow.js';
 import { SoldierRig } from './soldier-rig.js';
+
+// Rifle-on-RightHand calibration values, tuned in the debug-level
+// weapon-calibration tool. All in the bone's LOCAL space. The rifle
+// is parented to the bone and stays visible across every animation
+// (idle, walk, alerted aim, firing recoil, hit, death) — soldiers
+// always carry it.
+const RIFLE_FILE = 'Assets/Weapons/soldier_rifle.glb';
+const RIFLE_BONE = 'RightHand';
+const RIFLE_POS  = new THREE.Vector3(0.04, 0.16, 0.04);
+const RIFLE_ROT  = new THREE.Euler(
+   100.0 * Math.PI / 180,
+    -5.0 * Math.PI / 180,
+   -80.0 * Math.PI / 180,
+  'XYZ',
+);
+const RIFLE_SCALE = 0.481;
+
+// Bullet emergence point in RightHand-local space — calibrated in the
+// debug-level soldier-bullet hotspot tool. Bullets spawn from this
+// world-transformed point so they emerge from the rifle's muzzle and
+// follow the recoil animation correctly.
+const MUZZLE_HOTSPOT_LOCAL = new THREE.Vector3(0.08, 0.375, 0.07);
+const _tmpMuzzle = new THREE.Vector3();
+
+// Cache the rifle geometry+material so each new Enemy reuses the same
+// Three.js buffers — much cheaper than re-loading the GLB per soldier.
+let _rifleAsset = null;
+let _rifleLoadStarted = false;
+const _waitingForRifle = new Set();
+function _ensureRifleLoaded() {
+  if (_rifleAsset || _rifleLoadStarted) return;
+  _rifleLoadStarted = true;
+  new GLTFLoader().load(
+    RIFLE_FILE,
+    (gltf) => {
+      let mesh = null;
+      gltf.scene.traverse((c) => { if (c.isMesh && !mesh) mesh = c; });
+      if (!mesh) return;
+      mesh.updateMatrixWorld(true);
+      const geo = mesh.geometry.clone();
+      geo.applyMatrix4(mesh.matrixWorld);
+      _rifleAsset = { geometry: geo, material: mesh.material };
+      // Retro-attach to any soldier that's been waiting.
+      for (const enemy of _waitingForRifle) enemy._attachRifle();
+      _waitingForRifle.clear();
+    },
+    undefined,
+    (err) => console.error('Enemy: failed to load rifle', err),
+  );
+}
+_ensureRifleLoaded();
 
 const STEALTH_CONE_ANGLE = Math.PI / 4;
 const STEALTH_CONE_RANGE = 7;
@@ -29,6 +81,10 @@ export class Enemy {
     this.rig.position = { x, z };
     this.rig.load();
     this.mesh = this.rig.root;
+    // Rifle is always carried — _attachRifle waits for both the rig's
+    // skeleton and the rifle GLB to be ready before parenting.
+    this._rifle = null;
+    this._tryAttachRifle();
 
     this.coneSegments = 28;
     const coneGeo = new THREE.BufferGeometry();
@@ -378,7 +434,16 @@ export class Enemy {
         const owner = this.faction === 'friendly' ? 'player' : 'enemy';
         const fx = Math.sin(this.facing);
         const fz = Math.cos(this.facing);
-        game.spawnBullet(this.mesh.position.x, this.mesh.position.z, fx, fz, owner, this);
+        // Pull bullet spawn from the calibrated bone-local muzzle hotspot
+        // so the bullet (and its muzzle flash) emerge from the rifle tip
+        // and ride the recoil animation. Falls back to body center while
+        // the rifle rig is still streaming.
+        let sx = this.mesh.position.x, sz = this.mesh.position.z, sy = 0.6;
+        if (this._muzzleHotspot) {
+          const v = this._muzzleHotspot.getWorldPosition(_tmpMuzzle);
+          sx = v.x; sy = v.y; sz = v.z;
+        }
+        game.spawnBullet(sx, sz, fx, fz, owner, this, sy);
         if (this.rig) this.rig.triggerFiring();
         this.burstRemaining--;
         if (this.burstRemaining <= 0) {
@@ -599,6 +664,25 @@ export class Enemy {
 
   // Flip this soldier to the player's side: halves HP and switches faction
   // so they begin hunting hostiles. Visuals recolour to a friendly blue.
+  // World-space target for the hack-swarm VFX — the head bone if the
+  // rig has streamed in, otherwise the body centre raised to head
+  // height. Falls back gracefully so the swarm never fails to find
+  // somewhere to fly to. Caches the bone reference on first hit.
+  getHackTargetWorldPos(out = new THREE.Vector3()) {
+    if (!this._headBone && this.rig?._fbx) {
+      this.rig._fbx.traverse((node) => {
+        if (this._headBone) return;
+        if (/Head$/.test(node.name || '')) this._headBone = node;
+      });
+    }
+    if (this._headBone) {
+      this._headBone.getWorldPosition(out);
+    } else {
+      out.set(this.mesh.position.x, this.mesh.position.y + 1.5, this.mesh.position.z);
+    }
+    return out;
+  }
+
   hackLink() {
     if (!this.alive || this.faction === 'friendly') return;
     this.faction = 'friendly';
@@ -641,5 +725,51 @@ export class Enemy {
     this.facingArrow.visible = false;
     this.hpBarBg.visible     = false;
     this.hpBarFg.visible     = false;
+  }
+
+  // Wait for both the rig's skeleton and the cached rifle asset, then
+  // parent the rifle to the RightHand bone with the calibrated
+  // transform. If either side isn't ready yet, register and poll.
+  _tryAttachRifle() {
+    if (this._rifle) return;                  // already attached
+    const ready = !!(this.rig._fbx && _rifleAsset);
+    if (ready) { this._attachRifle(); return; }
+    _waitingForRifle.add(this);
+    // Also poll for the rig FBX in case the rifle is already cached
+    // but the rig is still streaming — clear the wait once attached.
+    const poll = setInterval(() => {
+      if (!this.alive) { clearInterval(poll); return; }
+      if (!this._rifle && this.rig._fbx && _rifleAsset) {
+        clearInterval(poll);
+        this._attachRifle();
+      }
+    }, 100);
+  }
+
+  _attachRifle() {
+    if (this._rifle || !_rifleAsset || !this.rig._fbx) return;
+    let hand = null;
+    this.rig._fbx.traverse((node) => {
+      if (!hand && new RegExp(`${RIFLE_BONE}$`).test(node.name || '')) hand = node;
+    });
+    if (!hand) {
+      console.warn('Enemy: RightHand bone not found; rifle not attached');
+      return;
+    }
+    const rifle = new THREE.Mesh(_rifleAsset.geometry, _rifleAsset.material);
+    rifle.castShadow = true;
+    rifle.position.copy(RIFLE_POS);
+    rifle.rotation.copy(RIFLE_ROT);
+    rifle.scale.setScalar(RIFLE_SCALE);
+    hand.add(rifle);
+    this._rifle = rifle;
+    // Empty marker at the calibrated muzzle hotspot — bone-local, so it
+    // tracks the recoil animation. We'll read its world position each
+    // shot to get the bullet spawn point.
+    const muzzle = new THREE.Object3D();
+    muzzle.position.copy(MUZZLE_HOTSPOT_LOCAL);
+    hand.add(muzzle);
+    this._muzzleHotspot = muzzle;
+    _waitingForRifle.delete(this);
   }
 }

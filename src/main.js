@@ -7,12 +7,16 @@ import { Drone } from './drone.js';
 import { Door } from './door.js';
 import { Obstacle, updateCrateDebris } from './obstacle.js';
 import { Mecha } from './mecha.js';
-import { Bullet } from './bullet.js';
+import { Bullet, updatePlayerArrowVFX } from './bullet.js';
+import { updateRocketExplosions } from './rocket-explosion.js';
+import { spawnHackSwarm, updateHackSwarm } from './hack-swarm.js';
+import { spawnConfetti, updateConfetti } from './confetti.js';
 import { Rocket } from './rocket.js';
 import { DebugSystem } from './debug.js';
 import { HackMinigame } from './hack.js';
 import { showCorpLogo } from './corplogo.js';
 import { runDebugLevel } from './debug-level.js';
+import { runTutorialLevel } from './tutorial-level.js';
 
 const hudMode     = document.getElementById('mode');
 
@@ -583,7 +587,7 @@ function findHackLinkTarget() {
 
 window.addEventListener('keydown', e => {
   if (window.__nanoDebugLevel) return;
-  if (gameOver || hacker.active || pendingHack) return;
+  if (gameOver || hacker.active || pendingHack || playerDying || mechaDying) return;
   const k = e.key.toLowerCase();
   // I / K — manual Y-offset for the loaded GLB tileset (debug only).
   // The procedural map was modelled assuming the tile origins sit at
@@ -655,11 +659,31 @@ window.addEventListener('keydown', e => {
           spotAMarker.visible = false;
           exitMarker.visible  = true;
           hudObj.innerHTML    = 'Objective: reach the <b style="color:#7f5">Exit</b>';
+          // Goal-hack flourish: 2× the hack-pickup confetti count,
+          // tinted with the Spot-A cyan palette so it reads as a
+          // larger, distinctly-coloured celebration.
+          spawnConfetti(scene, spotACell.x, 0.35, spotACell.y, {
+            particles: 60,
+            size: 0.20,
+            speed: 7.5,
+            colors: [0x22ddff, 0x66e8ff, 0x88f0ff, 0x33aacc, 0xb6f4ff],
+          });
         } else if (target.alive && typeof target.hackLink === 'function') {
           target.hackLink();
           // Hack-linking a mecha drops the player straight into possession —
           // no second "open the door" step. Eject (R) leaves it as an ally.
           if (target instanceof Mecha) enterMechaPossession(target);
+          // Hack-success VFX — a small swarm of additive points streams
+          // from the player's chest to the target. For soldiers the
+          // target tracks the head bone (set up via
+          // getHackTargetWorldPos); drones / mechas use mesh centre.
+          if (typeof target.getHackTargetWorldPos === 'function') {
+            spawnHackSwarm(
+              scene,
+              (out) => out.set(player.position.x, player.position.y + 1.0, player.position.z),
+              (out) => target.getHackTargetWorldPos(out),
+            );
+          }
         }
         return;
       }
@@ -725,20 +749,95 @@ let gameOver    = false;
 // is hidden, input routes to the mecha, and camera follows it. Mecha death
 // while possessed kills the player too.
 let possessedMecha = null;
+// Possession-transition state: while non-null, a "ghost" copy of the
+// player is fading out at its old position, surrounded by a swarm
+// streaming to the mecha. We track:
+//   ghostTimer — seconds remaining before the rig is fully hidden
+//   ghostPos   — frozen world position the ghost stands at
+const POSSESS_GHOST_DURATION = 1.5;   // seconds
+let   possessGhostTimer = 0;
+const possessGhostPos   = new THREE.Vector3();
+// Mecha-death-while-possessed sequence: HP-zero on the driven mecha
+// triggers the rig's full-body death clip; the player's input is
+// frozen during the hold and the "Destroyed inside the mecha"
+// overlay shows once the animation has had time to play out. The
+// hold duration is read from the actual clip on the rig (with a
+// small buffer) so we never cut the animation short, with a
+// safe fallback if the clip hasn't been resolved yet.
+const MECHA_DEATH_FALLBACK_HOLD = 3.5;     // seconds
+const MECHA_DEATH_BUFFER        = 0.4;     // extra hold after clip ends
+let   mechaDying       = false;
+let   mechaDeathTimer  = 0;
 
 function enterMechaPossession(m) {
   if (possessedMecha || !m || !m.alive) return;
   possessedMecha = m;
   m.enterPossession();
-  // Stash the body inside the mecha so any AI looking up world.player.position
-  // sees the mecha (rather than the abandoned human in the corridor).
-  player.mesh.position.x = m.mesh.position.x;
-  player.mesh.position.z = m.mesh.position.z;
-  player.mesh.visible    = false;
+  // Capture where the human was standing — the "ghost" copy stays
+  // here through the fade so the player sees their old body get
+  // dissolved. NOTE: we deliberately do NOT teleport player.mesh
+  // into the mecha during this window, so the ghost is visible at
+  // the right spot. The mesh moves to the mecha after the fade.
+  possessGhostPos.set(player.position.x, player.position.y, player.position.z);
+  possessGhostTimer = POSSESS_GHOST_DURATION;
+  // Make every material under the player rig transparent so we can
+  // animate opacity to 0 over the timer. enterMechaPossession runs
+  // once per possession, so caching the originals on userData is
+  // enough; eject restores them.
+  setRigOpacity(player, 1, /*storeOriginal=*/true);
   player.facingTri.visible = false;
   player.aimLine.visible   = false;
+  // Big swarm streaming from the ghost to the mecha — hack-link
+  // visualised: the player's consciousness flowing into the chassis.
+  spawnHackSwarm(
+    scene,
+    (out) => out.set(possessGhostPos.x, possessGhostPos.y + 1.0, possessGhostPos.z),
+    (out) => out.set(m.mesh.position.x, m.mesh.position.y + 1.4, m.mesh.position.z),
+    // Mecha possession is the most dramatic hack in the run — double
+    // the particle count vs. a soldier hack so the cast feels heavy.
+    { particles: 180, lifetime: POSSESS_GHOST_DURATION, size: 0.14 },
+  );
   updatePlayerHPHUD();
   updateShotHUD();
+}
+
+// Walk every Mesh / SkinnedMesh under the player's rig and apply a
+// uniform alpha to its materials. On the first call we stash the
+// originals on userData so eject can restore them cleanly. Idempotent
+// — calling with `storeOriginal=true` again won't double-stash.
+function setRigOpacity(p, alpha, storeOriginal = false) {
+  const apply = (m) => {
+    if (!m) return;
+    if (storeOriginal && m.userData._origOpacity === undefined) {
+      m.userData._origOpacity     = m.opacity ?? 1;
+      m.userData._origTransparent = m.transparent ?? false;
+    }
+    m.transparent = true;
+    m.opacity     = alpha;
+    m.depthWrite  = alpha > 0.99;
+  };
+  p.mesh.traverse((c) => {
+    if (!c.isMesh && !c.isSkinnedMesh) return;
+    if (Array.isArray(c.material)) c.material.forEach(apply);
+    else if (c.material)            apply(c.material);
+  });
+}
+function restoreRigOpacity(p) {
+  const restore = (m) => {
+    if (!m) return;
+    if (m.userData._origOpacity !== undefined) {
+      m.opacity     = m.userData._origOpacity;
+      m.transparent = m.userData._origTransparent;
+      m.depthWrite  = true;
+      delete m.userData._origOpacity;
+      delete m.userData._origTransparent;
+    }
+  };
+  p.mesh.traverse((c) => {
+    if (!c.isMesh && !c.isSkinnedMesh) return;
+    if (Array.isArray(c.material)) c.material.forEach(restore);
+    else if (c.material)            restore(c.material);
+  });
 }
 
 function ejectFromMecha() {
@@ -754,6 +853,21 @@ function ejectFromMecha() {
   player.facingDir.z = Math.cos(m.facing);
   player.mesh.visible = true;
   player.facingTri.visible = true;
+  // If we ejected mid-possession-fade, kill the ghost timer and
+  // restore the rig's authored opacity so the body re-materialises
+  // fully solid before the burst plays.
+  possessGhostTimer = 0;
+  restoreRigOpacity(player);
+  // Explosive swarm at the player's reappear position — hack-spell
+  // "the consciousness returns" beat. Burst mode: no seek, just
+  // outward expansion + fade.
+  spawnHackSwarm(
+    scene,
+    (out) => out.set(bx, 1.0, bz),
+    null,
+    // Eject burst matches enter-cast scale: doubled vs. soldier hack.
+    { mode: 'burst', particles: 160, lifetime: 0.9, size: 0.14, burstSpeed: 9 },
+  );
   m.leavePossession();
   possessedMecha = null;
   updatePlayerHPHUD();
@@ -786,11 +900,31 @@ function updatePlayerHPHUD() {
   }
   hudPlayerHP.innerHTML = `HP: <b>${playerHp} / ${PLAYER_MAX_HP}</b>`;
 }
+// Death sequence — between HP-zero and the "You were eliminated"
+// overlay, the human plays its falling-back-death clip. While dying
+// the player can no longer take damage, fire, or move; the world
+// keeps simulating so soldiers / drones don't freeze mid-step.
+const PLAYER_DEATH_HOLD = 2.2;     // seconds of death animation before overlay
+let   playerDying       = false;
+let   playerDeathTimer  = 0;
 function playerTakeDamage(n = 1) {
-  if (gameOver) return;
+  if (gameOver || playerDying) return;
   playerHp = Math.max(0, playerHp - n);
   updatePlayerHPHUD();
-  if (playerHp <= 0) endGame('You were eliminated');
+  if (playerHp <= 0) {
+    // Trigger the rig's death clip; falls back to the overlay path
+    // immediately if the rig isn't loaded yet.
+    const ok = player.rig?.triggerDeath?.('back') === true;
+    if (!ok) { endGame('You were eliminated'); return; }
+    playerDying      = true;
+    playerDeathTimer = PLAYER_DEATH_HOLD;
+    // Stop any in-flight player-bow recoil / battle pose so the death
+    // clip dominates without the bow hovering on the LeftHand.
+    player.aimLine.visible = false;
+    // Clear held keys + drop future inputs so the corpse can't keep
+    // walking / firing while the death animation plays.
+    player.setInputDisabled?.(true);
+  }
 }
 
 // Pending hack-link: briefly freezes the world and animates the lock-on ring
@@ -817,9 +951,13 @@ function updateShotHUD() {
   if (possessedMecha && possessedMecha.alive) {
     const sd = Math.max(0, possessedMecha.shootCooldown);
     const rd = Math.max(0, possessedMecha.rocketCooldown);
+    // Possessed mode rebinds the weapon controls — make the keys
+    // explicit in the HUD so the player knows F is the rocket
+    // launcher (SPACE is still the cannon).
     hudShot.innerHTML =
-      `Shot: ${_fmtCd(sd)} <span style="opacity:.5">|</span> ` +
-      `<span style="color:#ff8866">Rocket: ${_fmtCd(rd)}</span>`;
+      `<span style="opacity:.7">J</span> Shot: ${_fmtCd(sd)} ` +
+      `<span style="opacity:.5">|</span> ` +
+      `<span style="color:#ff8866"><span style="opacity:.7">K</span> Rocket: ${_fmtCd(rd)}</span>`;
     return;
   }
   hudShot.innerHTML = `Shot: ${_fmtCd(shotCooldown)}`;
@@ -827,15 +965,15 @@ function updateShotHUD() {
 
 window.addEventListener('keydown', e => {
   if (window.__nanoDebugLevel) return;
-  // F → mecha rocket launcher (only valid while possessing a mecha).
-  if (e.key.toLowerCase() === 'f') {
-    if (gameOver || hacker.active) return;
+  // K → mecha rocket launcher (only valid while possessing a mecha).
+  if (e.key.toLowerCase() === 'k') {
+    if (gameOver || hacker.active || playerDying || mechaDying) return;
     if (possessedMecha) possessedMecha.playerFireRocket(game);
     return;
   }
-  if (e.key !== ' ') return;
-  if (gameOver || hacker.active) return;
-  // While driving a mecha SPACE fires its 3-bullet fan instead of the
+  if (e.key.toLowerCase() !== 'j') return;
+  if (gameOver || hacker.active || playerDying || mechaDying) return;
+  // While driving a mecha J fires its 3-bullet fan instead of the
   // player's pistol shot. Cooldown is managed inside the mecha.
   if (possessedMecha) {
     possessedMecha.playerFire(game);
@@ -844,15 +982,21 @@ window.addEventListener('keydown', e => {
   if (shotCooldown > 0) return;
   const d = player.facingDir;
   const len = Math.hypot(d.x, d.z) || 1;
+  // Spawn the arrow from the bow's LeftHand bone position. Falls
+  // back to a forward offset if the bow rig hasn't loaded yet.
+  const muzzle = player.getBowMuzzleWorldPos?.(new THREE.Vector3());
+  const sx = muzzle ? muzzle.x : player.position.x + (d.x / len) * 0.6;
+  const sy = muzzle ? muzzle.y : 0.6;
+  const sz = muzzle ? muzzle.z : player.position.z + (d.z / len) * 0.6;
   game.spawnBullet(
-    player.position.x + (d.x / len) * 0.6,
-    player.position.z + (d.z / len) * 0.6,
+    sx, sz,
     d.x / len, d.z / len,
-    'player',
+    'player', null, sy,
   );
-  // Additive recoil overlay — character visibly fires regardless of
-  // whether they're standing or moving.
-  player.rig?.triggerRecoil();
+  // notifyShot() handles the recoil overlay AND the post-shot grace
+  // window that keeps the bow visible through the recoil settle
+  // before dissolving back to stealth.
+  player.notifyShot?.();
   shotCooldown = SHOT_COOLDOWN;
   updateShotHUD();
 });
@@ -900,13 +1044,13 @@ const game = {
     const spottedRoom = findRoomAt(player.position.x, player.position.z);
     spawnDroneBatch(spottedRoom, 2);
   },
-  spawnBullet(x, z, dx, dz, owner = 'enemy', shooter = null) {
-    bullets.push(new Bullet(scene, x, z, dx, dz, owner, shooter));
+  spawnBullet(x, z, dx, dz, owner = 'enemy', shooter = null, y = 0.6) {
+    bullets.push(new Bullet(scene, x, z, dx, dz, owner, shooter, y));
   },
   // Mecha-only — explosive round on a long cooldown. Lives in the same
   // bullets array since its update / alive / damage interface matches.
-  spawnRocket(x, z, dx, dz, owner = 'player', shooter = null) {
-    bullets.push(new Rocket(scene, x, z, dx, dz, owner, shooter));
+  spawnRocket(x, z, dx, dz, owner = 'player', shooter = null, y = 0.7) {
+    bullets.push(new Rocket(scene, x, z, dx, dz, owner, shooter, y));
   },
   // Helpers for obstacle / door interaction.
   obstacleAt,
@@ -921,9 +1065,22 @@ function updateModeUI() {
 }
 function endGame(msg) {
   gameOver = true;
-  overlayText.textContent = msg;
-  overlay.style.display   = 'flex';
+  // Stack the message + the restart hint so the player sees both
+  // without us having to touch the index.html layout.
+  overlayText.innerHTML =
+    `<div>${msg}</div>` +
+    `<div style="font-size:18px;opacity:.75;margin-top:14px;">` +
+    `Press <b style="color:#7ff">R</b> to restart` +
+    `</div>`;
+  overlay.style.display = 'flex';
 }
+// R-to-restart while game-over. Captured at the window level so it
+// fires regardless of focus state. Reload preserves no run state —
+// fine, that's the same behaviour as the overlay's "New Run" button.
+window.addEventListener('keydown', (e) => {
+  if (!gameOver) return;
+  if (e.key.toLowerCase() === 'r') location.reload();
+});
 
 const clock = new THREE.Clock();
 let   time  = 0;
@@ -941,19 +1098,63 @@ function animate() {
   if (tickPendingHack()) { renderer.render(scene, camera); return; }
   if (hacker.active)     { renderer.render(scene, camera); return; }
 
+  // Death hold — drain the timer; once spent show the overlay. We
+  // don't early-return here so the rest of the animate loop still
+  // ticks the rig + AI + renders during the death animation.
+  if (playerDying) {
+    playerDeathTimer -= dt;
+    if (playerDeathTimer <= 0 && !gameOver) endGame('You were eliminated');
+  }
+
   // Skip player.update while possessing a mecha — the human is hidden and
   // their input gets routed to the mecha inside that entity's own update.
   // Keep the human's position glued to the mecha so any AI looking up
   // world.player.position sees the mecha (no stale waypoint in the corridor
   // where the player got in).
   if (!possessedMecha) {
-    // shotReady gates the rig's battle (standing aim) pose — while
-    // reloading, the body drops back to the stealth bundle so the visual
-    // matches the "Shot: Xs" HUD readout.
-    player.update(dt, map, doorBlocksPlayer, battleMode, shotCooldown <= 0);
+    // While dying, freeze player input/movement but keep the rig's
+    // mixer ticking so the death clip plays. We pass zero-input args
+    // and the rig drives itself off its internal _dying / death blend.
+    if (playerDying) {
+      player.update(dt, map, doorBlocksPlayer, false, false);
+    } else {
+      // shotReady gates the rig's battle (standing aim) pose — while
+      // reloading, the body drops back to the stealth bundle so the visual
+      // matches the "Shot: Xs" HUD readout.
+      player.update(dt, map, doorBlocksPlayer, battleMode, shotCooldown <= 0);
+    }
   } else {
-    player.mesh.position.x = possessedMecha.mesh.position.x;
-    player.mesh.position.z = possessedMecha.mesh.position.z;
+    // While the possession-enter ghost is fading, KEEP the player
+    // mesh at its old (pre-possession) position so the dissolving
+    // body is visible to the camera. The mecha is already simulating
+    // independently. Once the timer expires we hide the rig and snap
+    // it inside the mecha (where it stays for AI-position reads).
+    if (possessGhostTimer > 0) {
+      possessGhostTimer -= dt;
+      const t = 1 - Math.max(0, possessGhostTimer) / POSSESS_GHOST_DURATION;
+      // Pin the ghost to the captured spot. We deliberately do NOT
+      // call player.update here — that would read player.keys (which
+      // the mecha is also reading for movement) and translate the
+      // ghost across the floor in lockstep with the mecha. Driving
+      // the rig directly with zero movement keeps it animating in
+      // place while the swarm carries the consciousness away.
+      player.rig.position    = { x: possessGhostPos.x, z: possessGhostPos.z };
+      player.rig.battleMode  = false;
+      player.rig.setMovement(0, 0);
+      player.rig.update(dt);
+      // Linear fade — every material under the rig dissolves to 0
+      // by the end of POSSESS_GHOST_DURATION.
+      setRigOpacity(player, 1 - t);
+      if (possessGhostTimer <= 0) {
+        // Fade complete — hide the rig and restore opacity so the
+        // next eject re-materialises a fully-opaque body.
+        player.mesh.visible = false;
+        restoreRigOpacity(player);
+      }
+    } else {
+      player.mesh.position.x = possessedMecha.mesh.position.x;
+      player.mesh.position.z = possessedMecha.mesh.position.z;
+    }
     // HUD readouts pull live values from the mecha — refresh every frame so
     // mecha HP / cooldown updates are visible.
     updatePlayerHPHUD();
@@ -976,12 +1177,50 @@ function animate() {
     : player.movedThisFrame;
 
   let worldDt = dt;
-  if (battleMode && !ctrlMoved) {
+  // Slow-mo is suspended during the mecha-death hold so the
+  // wreck's death animation plays out at normal speed instead of
+  // dragging across ~12× the wall-clock duration.
+  if (battleMode && !ctrlMoved && !mechaDying) {
     worldDt = dt * 0.08;
   }
 
-  // Aim line is only meaningful for the human form in combat.
-  player.aimLine.visible = battleMode && !possessedMecha;
+  // Aim line shows in battle for whichever body the player is driving —
+  // human OR possessed mecha. While the possess-enter ghost is still
+  // dissolving we hide it (the camera is on the mecha but the human
+  // body is still mid-fade, so a stray line at the ghost would read
+  // wrong). Position + facing follow the active body each frame.
+  const aimVisible = battleMode && !playerDying && (!possessedMecha || possessGhostTimer <= 0);
+  player.aimLine.visible = aimVisible;
+  if (possessedMecha && aimVisible) {
+    player.aimLine.position.set(possessedMecha.mesh.position.x, 0, possessedMecha.mesh.position.z);
+    player.aimLine.rotation.y = possessedMecha.facing;
+  }
+  if (aimVisible) {
+    // Origin / facing for the hostile-detection segment depend on
+    // who's currently driving — possessed mecha or human player.
+    const ox = possessedMecha ? possessedMecha.mesh.position.x : player.position.x;
+    const oz = possessedMecha ? possessedMecha.mesh.position.z : player.position.z;
+    const fx = possessedMecha ? Math.sin(possessedMecha.facing) : player.facingDir.x;
+    const fz = possessedMecha ? Math.cos(possessedMecha.facing) : player.facingDir.z;
+    const RANGE = 6;
+    let hostile = false;
+    const checkList = (arr) => {
+      if (hostile || !arr) return;
+      for (const e of arr) {
+        if (!e?.alive || e.faction === 'friendly') continue;
+        const ex = e.mesh.position.x - ox, ez = e.mesh.position.z - oz;
+        const along = ex * fx + ez * fz;             // projection on aim
+        if (along < 0 || along > RANGE) continue;
+        // Perpendicular distance from segment, then compare to radius.
+        const perp = Math.hypot(ex - fx * along, ez - fz * along);
+        if (perp <= (e.hitRadius ?? 0.45)) { hostile = true; return; }
+      }
+    };
+    checkList(enemies);
+    checkList(drones);
+    checkList(mechas);
+    player.setAimLineHostile(hostile);
+  }
 
   // Entities pull `realDt` off the world view to rotate / cool down in real
   // time even while the world is in slow-mo. Movement still uses worldDt so
@@ -997,16 +1236,32 @@ function animate() {
   for (const m of mechas)  m.update(worldDt, map, worldView, game);
   for (const dr of doors)  dr.update(dt, worldView);
 
-  // Possessed mecha just blew up — the player goes with it.
-  if (possessedMecha && !possessedMecha.alive) {
-    const wreck = possessedMecha;
-    possessedMecha = null;
-    // Restore the human visuals so the eliminated overlay isn't behind the
-    // hidden body (and so a future "New Run" reset doesn't carry over the
-    // hidden state). Position doesn't matter — the run is over.
-    player.mesh.visible = true;
-    player.facingTri.visible = true;
-    return endGame('Destroyed inside the mecha');
+  // Possessed mecha just blew up — the player goes with it, but we
+  // hold off the overlay until the rig's death animation plays out.
+  // possessedMecha stays set so the camera keeps following the wreck;
+  // input is disabled so the player can't keep firing while it falls.
+  if (possessedMecha && !possessedMecha.alive && !mechaDying) {
+    mechaDying      = true;
+    // Read the death clip's actual duration off the rig so we wait
+    // for the entire animation. Falls back to a fixed hold if the
+    // clip hasn't been resolved yet (rig still loading).
+    const clip = possessedMecha.rig?._actions?.death?.getClip?.();
+    mechaDeathTimer = clip?.duration
+      ? clip.duration + MECHA_DEATH_BUFFER
+      : MECHA_DEATH_FALLBACK_HOLD;
+    player.setInputDisabled?.(true);
+  }
+  if (mechaDying) {
+    mechaDeathTimer -= dt;
+    if (mechaDeathTimer <= 0 && !gameOver) {
+      // Hand-off to game-over: restore human visuals so the overlay
+      // isn't behind a hidden body, drop the possession reference,
+      // and show the eliminated screen.
+      player.mesh.visible      = true;
+      player.facingTri.visible = true;
+      possessedMecha = null;
+      return endGame('Destroyed inside the mecha');
+    }
   }
 
   // Player bullets can damage both soldiers and drones (and mechas, added
@@ -1057,6 +1312,13 @@ function animate() {
     if (hacksCollected < MAX_HACKS &&
         Math.hypot(pos.x - m.position.x, pos.z - m.position.z) < 0.7) {
       m.userData.collected = true;
+      // Confetti burst at the cube's last position, in the same
+      // purple palette as the HUD's hack-points readout — sells the
+      // pickup with a small celebratory flourish.
+      spawnConfetti(scene, m.position.x, m.position.y, m.position.z, {
+        particles: 30,
+        size: 0.18,
+      });
       scene.remove(m);
       scene.remove(m.userData.ring);
       hacksCollected++;
@@ -1072,9 +1334,22 @@ function animate() {
   }
 
   debug.update(player, enemies, battleMode);
-  // Tick crate debris on real time so the explosion-pop reads honestly
-  // even if the world is slow-mo'd. (Visual flourish only, not gated.)
-  updateCrateDebris(dt);
+  // Tick crate debris on worldDt so they slow down with everything
+  // else when SUPERHOT slow-mo is active.
+  updateCrateDebris(worldDt);
+  // Same gating for the arrow-impact explosions — they're a world VFX
+  // and should bend with slow-mo.
+  updatePlayerArrowVFX(worldDt);
+  // Mecha rocket-impact blue explosion VFX — also slow-mo gated.
+  updateRocketExplosions(worldDt);
+  // Hack-success swarm VFX runs on REAL dt — slow-mo would otherwise
+  // stretch the cast to 12+ real seconds while the player's standing
+  // still in battle, which reads as "the swarm didn't fire". The cast
+  // is a UI flourish, not a world event, so it shouldn't bend.
+  updateHackSwarm(dt);
+  // Confetti — UI-flourish only, also runs on real dt so it doesn't
+  // get stretched by slow-mo when the player bags a pickup mid-combat.
+  updateConfetti(dt);
   renderer.render(scene, camera);
 }
 
@@ -1082,7 +1357,24 @@ updateModeUI();
 updateHacksHUD();
 updateShotHUD();
 updatePlayerHPHUD();
-// Intro splash: shows the target corp for a few seconds before the run
-// begins, then starts the animation loop. TAB during the splash diverts
-// into the empty character/animation debug level instead.
-showCorpLogo({ durationMs: 3500, fadeMs: 700 }, animate, runDebugLevel);
+// On the first visit of a session we play the tutorial straight away.
+// The tutorial reloads the page when it finishes (or when the player
+// declines the choice on step 1), and the second pass through this
+// module sees `nanoTutorialDone === '1'` in sessionStorage so it
+// falls through to the normal corp-logo splash + main-game flow.
+// sessionStorage scopes the "played already" flag to the current
+// browser tab so a fresh run / new tab gets the tutorial again.
+//
+// TAB during the splash still skips into the debug level; T into a
+// fresh replay of the tutorial — both routes are kept for testing.
+const TUTORIAL_DONE_KEY = 'nanoTutorialDone';
+const tutorialDone = (() => {
+  try { return sessionStorage.getItem(TUTORIAL_DONE_KEY) === '1'; }
+  catch (_) { return false; }
+})();
+if (!tutorialDone) {
+  try { sessionStorage.setItem(TUTORIAL_DONE_KEY, '1'); } catch (_) {}
+  runTutorialLevel();
+} else {
+  showCorpLogo({ durationMs: 3500, fadeMs: 700 }, animate, runDebugLevel, runTutorialLevel);
+}

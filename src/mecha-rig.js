@@ -95,6 +95,8 @@ const _tmpQ1 = new THREE.Quaternion();
 const _tmpQ2 = new THREE.Quaternion();
 const _tmpQ3 = new THREE.Quaternion();
 const _tmpQ4 = new THREE.Quaternion();
+const _tmpQ5 = new THREE.Quaternion();
+const _Y_AXIS = new THREE.Vector3(0, 1, 0);
 
 export class MechaRig {
   constructor(scene, options = {}) {
@@ -214,6 +216,14 @@ export class MechaRig {
     // modification path actually affect rendering, independent of the
     // cannon/rocket capture-and-solve logic. Toggled from the debug HUD.
     this.forceSpineIdentity = false;
+    // Per-weapon spine-yaw offsets (radians) applied to the upper body
+    // while the corresponding arm is held. Cannon and rocket clips
+    // each plant the torso slightly off the bullet axis, so we steer
+    // each one back independently — weighted by its blend value so a
+    // mid-swap (e.g. snapRocketHeld during a cannon hold) interpolates
+    // smoothly between the two offsets without popping.
+    this._cannonUpperBodyYaw = 0;
+    this._rocketUpperBodyYaw = 0;
   }
 
   get diagnostics() { return this._diag; }
@@ -238,6 +248,19 @@ export class MechaRig {
   setMovement(wx, wz) {
     this._wx = wx;
     this._wz = wz;
+  }
+
+  // Public — set the per-weapon spine-yaw offsets (radians). Each is
+  // independently weighted by its own arm-blend in the post-mixer
+  // spine block so a swap from cannon → rocket interpolates between
+  // the two offsets instead of snapping. Pass either named arg to
+  // update only that weapon.
+  setShootingUpperBodyYaw({ cannon, rocket } = {}) {
+    if (typeof cannon === 'number') this._cannonUpperBodyYaw = cannon;
+    if (typeof rocket === 'number') this._rocketUpperBodyYaw = rocket;
+  }
+  getShootingUpperBodyYaw() {
+    return { cannon: this._cannonUpperBodyYaw, rocket: this._rocketUpperBodyYaw };
   }
 
   get isHit()        { return this._hitting; }
@@ -817,6 +840,24 @@ export class MechaRig {
         this._spineBone.quaternion.slerp(desiredLocal, armBlend);
         this._diag.adjustDeg   = preSpine.angleTo(this._spineBone.quaternion) * 180 / Math.PI;
         this._diag.compensated = true;
+      }
+    }
+    // Shooting-time yaw offset — applied independently of the spine
+    // anchor block above. The anchor only activates once the raise
+    // animation completes (capture happens in the 'finished' handler),
+    // but we want the torso rotation to ramp PROGRESSIVELY during the
+    // raise itself — otherwise the yaw pops in on the frame after the
+    // raise lands. Gating purely on the per-weapon blend gives a
+    // smooth ramp during arming and an immediate snap on disarm
+    // (because _cannonBlend / _rocketBlend ramp down via the smoother
+    // BUT we also force-skip while _disarming is set so the disarm
+    // animation plays its lowering pose without the offset).
+    if (!this._disarming && this._spineBone) {
+      const yaw = this._cannonUpperBodyYaw * this._cannonBlend
+                + this._rocketUpperBodyYaw * this._rocketBlend;
+      if (yaw) {
+        _tmpQ5.setFromAxisAngle(_Y_AXIS, yaw);
+        this._spineBone.quaternion.multiply(_tmpQ5);
       }
     }
   }
